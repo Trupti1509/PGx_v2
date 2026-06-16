@@ -250,7 +250,7 @@ def load_step4_data(path):
     detailed = df[df["Evaluation Group"] == "Has Guidance"]["Drug Name"].nunique()
     oem = df[df["Evaluation Group"] == "No Current Guidance"]["Drug Name"].nunique()
 
-    print(f"[INFO] Loaded from Step 4 -> {detailed} drugs for detailed pages | {oem} drugs for Other Evaluated Medications")
+    # print(f"[INFO] Loaded from Step 4 -> {detailed} drugs for detailed pages | {oem} drugs for Other Evaluated Medications")
 
     return df
 
@@ -273,10 +273,10 @@ def load_drug_gene_catalog(step4_path: str) -> dict:
             if drug and genes_str and genes_str.lower() != "nan":
                 genes = [g.strip() for g in genes_str.split(",") if g.strip()]
                 catalog[drug] = genes
-        print(f"[INFO] Loaded drug-gene catalog: {len(catalog)} entries")
+        # print(f"[INFO] Loaded drug-gene catalog: {len(catalog)} entries")
         return catalog
     except Exception:
-        print("[WARN] Drug Gene Catalog sheet not found in Step 4 output — gene status column will be limited.")
+        # print("[WARN] Drug Gene Catalog sheet not found in Step 4 output — gene status column will be limited.")
         return {}
 
 def load_all_evaluated_drugs(step4_path: str) -> pd.DataFrame:
@@ -288,10 +288,10 @@ def load_all_evaluated_drugs(step4_path: str) -> pd.DataFrame:
             sheet_name = "All Evaluated Drugs"
             df = pd.read_excel(step4_path, sheet_name=sheet_name)
         df.columns = [c.strip() for c in df.columns]
-        print(f"[INFO] Loaded {sheet_name}: {len(df)} rows | {df['Drug Name'].nunique()} unique drugs across {df['Drug Category'].nunique()} categories")
+        # print(f"[INFO] Loaded {sheet_name}: {len(df)} rows | {df['Drug Name'].nunique()} unique drugs across {df['Drug Category'].nunique()} categories")
         return df
     except Exception:
-        print("[WARN] 'Genotype and All Sources' sheet not found — Executive Summary will be skipped.")
+        # print("[WARN] 'Genotype and All Sources' sheet not found — Executive Summary will be skipped.")
         return pd.DataFrame()
 
 def load_qc_flags(step3_path: str) -> pd.DataFrame:
@@ -311,10 +311,10 @@ def load_drug_coverage(step4_path: str) -> pd.DataFrame:
         if "In PharmCAT" not in df.columns:
             return pd.DataFrame()
         pharmcat_drugs = df[df["In PharmCAT"].astype(str).str.strip().str.lower() == "yes"].copy()
-        print(f"[INFO] Drug Coverage — {len(pharmcat_drugs)} drugs with In PharmCAT=Yes")
+        # print(f"[INFO] Drug Coverage — {len(pharmcat_drugs)} drugs with In PharmCAT=Yes")
         return pharmcat_drugs
     except Exception:
-        print("[WARN] Drug Coverage sheet not found in Step 4 output — no-guidance list skipped.")
+        # print("[WARN] Drug Coverage sheet not found in Step 4 output — no-guidance list skipped.")
         return pd.DataFrame()
 
 def _parse_pharmcat_no_guidance(sample_id: str) -> set:
@@ -333,24 +333,24 @@ def _parse_pharmcat_no_guidance(sample_id: str) -> set:
             html_path = p
             break
     if not html_path:
-        print("[WARN] PharmCAT report HTML not found — cannot parse 'Drugs With No Guidance'.")
+        # print("[WARN] PharmCAT report HTML not found — cannot parse 'Drugs With No Guidance'.")
         return set()
     try:
         with open(html_path, encoding="utf-8", errors="replace") as f:
             html = f.read()
         idx = html.find("Drugs With No Guidance")
         if idx == -1:
-            print(f"[WARN] 'Drugs With No Guidance' section not found in {os.path.basename(html_path)}")
+            # print(f"[WARN] 'Drugs With No Guidance' section not found in {os.path.basename(html_path)}")
             return set()
         end_ul = html.find("</ul>", idx)
         if end_ul == -1:
             return set()
         snippet = html[idx : end_ul + 5]
         drugs = set(d.strip().lower() for d in _re.findall(r"<li>([^<]+)</li>", snippet))
-        print(f"[INFO] PharmCAT report 'Drugs With No Guidance': {len(drugs)} drug(s)")
+        # print(f"[INFO] PharmCAT report 'Drugs With No Guidance': {len(drugs)} drug(s)")
         return drugs
     except Exception as e:
-        print(f"[WARN] Could not parse PharmCAT report HTML: {e}")
+        # print(f"[WARN] Could not parse PharmCAT report HTML: {e}")
         return set()
 
 def load_master_data(sample_id):
@@ -360,7 +360,7 @@ def load_master_data(sample_id):
     recs_df = pd.DataFrame()
 
     if not step3_files:
-        print("[WARN] Could not find Step 3 MASTER file! Falling back to Step 4 data.")
+        # print("[WARN] Could not find Step 3 MASTER file! Falling back to Step 4 data.")
         return df_genes, drug_gene_map, recs_df
 
     matched = [f for f in step3_files if os.path.basename(f) == f"step3_{sample_id}_MASTER.xlsx"]
@@ -466,8 +466,8 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
     df_detailed = df[df["Evaluation Group"] == "Has Guidance"].copy()
     df_oem = df[df["Evaluation Group"] == "No Current Guidance"].copy()
 
-    print(f"[INFO] Using Step 4 routing in build_report -> {len(df_detailed['Drug Name'].unique())} detailed | "
-          f"{len(df_oem['Drug Name'].unique())} OEM")
+    # print(f"[INFO] Using Step 4 routing in build_report -> {len(df_detailed['Drug Name'].unique())} detailed | "
+    #       f"{len(df_oem['Drug Name'].unique())} OEM")
 
     df_master_genes, drug_gene_map, recs_df = load_master_data(sample_id)
     if df_master_genes.empty:
@@ -539,8 +539,8 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
             _step4_demoted.add(drug)
 
     if _step4_demoted:
-        print(f"[INFO] {len(_step4_demoted)} PharmCAT drug(s) have only 'No Recommendation' in Step4 → No Current Guidance")
-
+        pass
+        # print(f"[INFO] {len(_step4_demoted)} PharmCAT drug(s) have only 'No Recommendation' in Step4 → No Current Guidance")
     # 4. Combine: final No Current Guidance set = PharmCAT No Guidance + Step4 demoted
     final_no_guid = pharmcat_no_guid_from_report | _step4_demoted
     
@@ -553,12 +553,14 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
                 final_no_guid.add(drug)
     
     if _forced_no_guideline:
-        print(f"[INFO] {len(_forced_no_guideline)} drug(s) forced to No Current Guidance:")
+        pass
+        # print(f"[INFO] {len(_forced_no_guideline)} drug(s) forced to No Current Guidance:")
         for d in sorted(_forced_no_guideline):
-            print(f"       - {d}")
+            pass
+            # print(f"       - {d}")
     
-    print(f"[INFO] Total No Current Guidance: {len(final_no_guid)} drug(s) "
-          f"({len(pharmcat_no_guid_from_report)} from PharmCAT report + {len(_step4_demoted)} from Step4 no-rec + {len(_forced_no_guideline)} forced)")
+    # print(f"[INFO] Total No Current Guidance: {len(final_no_guid)} drug(s) "
+    #       f"({len(pharmcat_no_guid_from_report)} from PharmCAT report + {len(_step4_demoted)} from Step4 no-rec + {len(_forced_no_guideline)} forced)")
 
     # 5. Apply routing: force No-Current-Guidance drugs into that group,
     #    ensure they are NOT in detailed or OEM
@@ -573,7 +575,7 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
         # Remove No-Guidance drugs from detailed and OEM (they go to their own section)
         df_detailed = df_detailed[~df_detailed["Drug Name"].astype(str).str.strip().str.lower().isin(final_no_guid)].copy()
         df_oem = df_oem[~df_oem["Drug Name"].astype(str).str.strip().str.lower().isin(final_no_guid)].copy()
-        print(f"[INFO] After PharmCAT routing: {df_detailed['Drug Name'].nunique()} detailed | {df_oem['Drug Name'].nunique()} OEM | {len(final_no_guid)} No Current Guidance")
+        # print(f"[INFO] After PharmCAT routing: {df_detailed['Drug Name'].nunique()} detailed | {df_oem['Drug Name'].nunique()} OEM | {len(final_no_guid)} No Current Guidance")
 
     # ── Post-load demotion (Rule D) ─────────────────────────────────────
     _pharmcat_drug_names: set = set(k.lower() for k in drug_gene_map.keys())
@@ -591,11 +593,14 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
             _rule_d_demoted.append(_drug_name)
 
     if _rule_d_demoted:
-        print(f"[INFO] Rule D: {len(_rule_d_demoted)} drug(s) demoted to OEM:")
+        pass
+        # print(f"[INFO] Rule D: {len(_rule_d_demoted)} drug(s) demoted to OEM:")
         for _d in _rule_d_demoted[:20]:
-            print(f"       - {_d}")
+            pass
+            # print(f"       - {_d}")
         if len(_rule_d_demoted) > 20:
-            print(f"       ... and {len(_rule_d_demoted) - 20} more")
+            pass
+            # print(f"       ... and {len(_rule_d_demoted) - 20} more")
 
         _rule_d_keys = {d.strip().lower() for d in _rule_d_demoted}
         _rule_d_mask = df_detailed["Drug Name"].astype(str).str.strip().str.lower().isin(_rule_d_keys)
@@ -873,19 +878,24 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
                     df_oem.loc[df_oem["Drug Name"].astype(str).str.strip().str.lower() == dd, "Drug Category"] = "Other Evaluated Medications"
 
             if demoted:
-                print(f"[INFO] {len(demoted)} drug(s) demoted to OEM (no matching CPIC/DPWG/FDA rec):")
+                pass
+                # print(f"[INFO] {len(demoted)} drug(s) demoted to OEM (no matching CPIC/DPWG/FDA rec):")
                 for d in demoted[:60]:
-                    print(f"       - {d}")
+                    pass
+                    # print(f"       - {d}")
             # Report some Activity Score matching examples to help debugging
             if activity_score_matches:
-                print(f"[INFO] Activity Score based matches captured: {len(activity_score_matches)} example(s). Showing up to 10:")
+                pass
+                # print(f"[INFO] Activity Score based matches captured: {len(activity_score_matches)} example(s). Showing up to 10:")
                 for ex in activity_score_matches[:10]:
-                    print(f"       - Drug: {ex.get('drug')} | Gene field: {ex.get('gene_field')} | source: {ex.get('source')} | rec_AS={ex.get('rec_AS')} obs_AS={ex.get('obs_AS')} | rec_dip={ex.get('rec_diplotype')} obs_dip={ex.get('obs_diplotype')}")
+                    pass
+                    # print(f"       - Drug: {ex.get('drug')} | Gene field: {ex.get('gene_field')} | source: {ex.get('source')} | rec_AS={ex.get('rec_AS')} obs_AS={ex.get('obs_AS')} | rec_dip={ex.get('rec_diplotype')} obs_dip={ex.get('obs_diplotype')}")
         else:
             # If no Step3 recs available, keep prior guided behavior (no-op)
             pass
     except Exception as _e:
-        print(f"[WARN] Authoritative-source enforcement failed: {_e}")
+        pass
+        # print(f"[WARN] Authoritative-source enforcement failed: {_e}")
 
     # ── TOC & Page Generation ───────────────────────────────────────────
     df_detailed_for_toc = df_detailed.copy()
@@ -893,7 +903,7 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
     toc_start_pg = 1
     pg = 1 + toc_pg_count
 
-    print(f"[INFO] TOC estimate: {toc_pg_count} page(s) | content pages start at pg {pg}")
+    # print(f"[INFO] TOC estimate: {toc_pg_count} page(s) | content pages start at pg {pg}")
 
     # Introduction pages
     welcome_pg = pg
@@ -947,7 +957,7 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
                         _placeholder_rows[col] = ""
                 zone_df = pd.concat([zone_df, _placeholder_rows[zone_df.columns]], ignore_index=True)
     except Exception as _exc:
-        print(f"[WARN] Executive summary zone_df build failed: {_exc}")
+        # print(f"[WARN] Executive summary zone_df build failed: {_exc}")
         zone_df = all_eval_df
     pg = safe_append(pages, executive_summary_template(df, patient_name, pg, zone_df=zone_df), pg)
 
@@ -983,7 +993,7 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
                         break
         except:
             pass
-    print(f"[INFO] rs12777823 in step1 VCF: {_rs12777823_in_step1}")
+    # print(f"[INFO] rs12777823 in step1 VCF: {_rs12777823_in_step1}")
 
     # Drug Detail Pages
     category_col = "Therapeutic Category" if "Therapeutic Category" in df_detailed.columns else "Drug Category"
@@ -1067,11 +1077,13 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
             toc_entries.append(("section1", "No Guideline Available", no_guid_start_pg))
             res = pharmcat_no_guidance_template(_no_guid_df, patient_name, no_guid_start_pg)
             pg  = safe_append(pages, res, pg)
-            print(f"[INFO] No Guideline Available: {_no_guid_df['Drug Name'].nunique()} drugs at pg {no_guid_start_pg}")
+            # print(f"[INFO] No Guideline Available: {_no_guid_df['Drug Name'].nunique()} drugs at pg {no_guid_start_pg}")
         else:
-            print("[INFO] No drugs for 'No Guideline Available' section.")
+            pass
+            # print("[INFO] No drugs for 'No Guideline Available' section.")
     else:
-        print("[INFO] No drugs for 'No Guideline Available' section.")
+        pass
+        # print("[INFO] No drugs for 'No Guideline Available' section.")
 
     # === OTHER EVALUATED MEDICATIONS ===
     other_start_pg = pg
@@ -1080,7 +1092,7 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
     from HELPER.htmls_drug_wise import other_evaluated_medicines_template
     res = other_evaluated_medicines_template(df_oem, patient_name, pg, df_master_genes, drug_gene_map)
     pg = safe_append(pages, res, pg)
-    print(f"[INFO] Other Evaluated Medications: {df_oem['Drug Name'].nunique()} drugs at pg {other_start_pg}")
+    # print(f"[INFO] Other Evaluated Medications: {df_oem['Drug Name'].nunique()} drugs at pg {other_start_pg}")
 
     # Appendix
     toc_entries.append(("chapter", "5. Appendix", None))
@@ -1107,7 +1119,7 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
     actual_toc_pg_count = _estimate_toc_pages_from_entries(toc_entries)
     if actual_toc_pg_count != toc_pg_count:
         delta = actual_toc_pg_count - toc_pg_count
-        print(f"[INFO] TOC adjusted: {actual_toc_pg_count} page(s) after height-aware calculation")
+        # print(f"[INFO] TOC adjusted: {actual_toc_pg_count} page(s) after height-aware calculation")
         toc_entries = [
             (kind, label, (pagenum + delta if isinstance(pagenum, int) and pagenum > toc_pg_count else pagenum))
             for kind, label, pagenum in toc_entries
@@ -1117,15 +1129,15 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
     for i, toc_page in enumerate(toc_pages):
         pages.insert(i, toc_page)
 
-    print(f"[INFO] Report total: {len(pages)} pages")
+    # print(f"[INFO] Report total: {len(pages)} pages")
     return pages
 
 def main(patient_name: str, sample_id: str = ""):
     name = patient_name.strip()
 
     print("\n" + "=" * 60)
-    print("  PGx Pipeline -- Step 5: PDF Report Generation")
-    print(f"  Patient: {name}")
+    # print("  PGx Pipeline -- Step 5: PDF Report Generation")
+    # print(f"  Patient: {name}")
     print("=" * 60)
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -1137,17 +1149,18 @@ def main(patient_name: str, sample_id: str = ""):
         pinned = os.path.join(RESULTS_DIR, f"step4_{sample_id}_all_recc.xlsx")
         path   = pinned if os.path.exists(pinned) else find_latest_step4()
         if not os.path.exists(pinned):
-            print(f"[WARN] Pinned step4 file not found ({pinned}), falling back to latest")
+            pass
+            # print(f"[WARN] Pinned step4 file not found ({pinned}), falling back to latest")
     else:
         path = find_latest_step4()
-    print(f"[DATA] {path}")
+    # print(f"[DATA] {path}")
 
     basename  = os.path.basename(path)
     sample_id = basename.replace("step4_", "").replace("_all_recc.xlsx", "").replace("_all_recc.csv", "")
 
     df = load_step4_data(path)
-    print(f"[DATA] {len(df)} rows | {df['Drug Name'].nunique()} drugs | {df['Drug Category'].nunique()} categories")
-    print(f"[DATA] Categories: {sorted(df['Drug Category'].unique())}")
+    # print(f"[DATA] {len(df)} rows | {df['Drug Name'].nunique()} drugs | {df['Drug Category'].nunique()} categories")
+    # print(f"[DATA] Categories: {sorted(df['Drug Category'].unique())}")
 
     pages = build_report(df, name, sample_id, step4_path=path)
 

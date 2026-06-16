@@ -48,7 +48,7 @@ def _is_header_or_meta(s: str) -> bool:
     return False
 
 def load_pharmcat_positions(path):
-    print(f"[INFO] Loading PharmCAT reference: {path}")
+    # print(f"[INFO] Loading PharmCAT reference: {path}")
     if not os.path.exists(path):
         bgz = os.path.join(
             os.path.dirname(path) or ".",
@@ -88,7 +88,7 @@ def load_pharmcat_positions(path):
                         "alt": alt,
                     }
 
-    print(f"[INFO] Loaded {len(targets)} PharmCAT target rsIDs from {path}")
+    # print(f"[INFO] Loaded {len(targets)} PharmCAT target rsIDs from {path}")
 
     # Inject supplemental SNPs that are not tracked by PharmCAT but are needed
     added = []
@@ -97,8 +97,8 @@ def load_pharmcat_positions(path):
             targets[rsid] = info
             added.append(rsid)
     if added:
-        print(f"[INFO] Injected {len(added)} supplemental SNP(s) into target list: {', '.join(added)}")
-
+        pass
+        # print(f"[INFO] Injected {len(added)} supplemental SNP(s) into target list: {', '.join(added)}")
     return meta_lines, targets
 
 def compute_vcf_gt(a1, a2, ref, alt_str):
@@ -195,8 +195,8 @@ def convert_raw_to_vcf(raw_path, meta_lines, targets, out_path, sample_id):
     total_lines = matched = 0
 
     size = os.path.getsize(raw_path)
-    print(f"[INFO] Raw file: {raw_path} ({size/1024/1024:.2f} MB)")
-    print("[INFO] Scanning and matching variants")
+    # print(f"[INFO] Raw file: {raw_path} ({size/1024/1024:.2f} MB)")
+    # print("[INFO] Scanning and matching variants")
 
     with open(raw_path, encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -233,11 +233,11 @@ def convert_raw_to_vcf(raw_path, meta_lines, targets, out_path, sample_id):
     if not matches:
         die("[ERROR] No variants matched. Check raw file format and contents.")
 
-    print(f"[INFO] Matched {len(matches)} variants. Sorting.")
+    # print(f"[INFO] Matched {len(matches)} variants. Sorting.")
     matches.sort(key=lambda m: (CHROM_ORDER.get(m["chrom"], 99), m["pos"]))
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    print(f"[INFO] Writing VCF: {out_path}")
+    # print(f"[INFO] Writing VCF: {out_path}")
 
     with open(out_path, "w", encoding="ascii", newline="\n") as out:
         out.write("##fileformat=VCFv4.2\n")
@@ -255,10 +255,10 @@ def convert_raw_to_vcf(raw_path, meta_lines, targets, out_path, sample_id):
             out.write(f"{m['chrom']}\t{m['pos']}\t{m['id']}\t{m['ref']}\t{m['alt']}\t.\tPASS\t.\tGT\t{m['gt']}\n")
 
     elapsed = time.time() - t0
-    print("[INFO] Step 1 complete")
-    print(f"[INFO] Processing time: {elapsed:.1f} s")
-    print(f"[INFO] Variants written: {len(matches)}")
-    print(f"[INFO] Output VCF: {out_path}")
+    # print("[INFO] Step 1 complete")
+    # print(f"[INFO] Processing time: {elapsed:.1f} s")
+    # print(f"[INFO] Variants written: {len(matches)}")
+    # print(f"[INFO] Output VCF: {out_path}")
 
 def run_step1(raw_path: str):
     if not os.path.exists(raw_path):

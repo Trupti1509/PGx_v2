@@ -447,7 +447,7 @@ def main(argv=None):
         args = ap.parse_args(argv)
 
     report = args.report.strip() or latest_report()
-    print(f"[STEP 3] Processing: {report}")
+    # print(f"[STEP 3] Processing: {report}")
 
     data = load_json(report)
 
@@ -511,7 +511,7 @@ def main(argv=None):
         write(df_qc, "4_QC_FLAGS", "#BF8F00")
         write(df_cites, "5_CITATIONS", "#7030A0")
 
-    print(f"[STEP 3] Success: {out_file}")
+    # print(f"[STEP 3] Success: {out_file}")
 
 if __name__ == "__main__":
     main()

@@ -727,7 +727,7 @@ def how_to_read_template(name, pg):
         ("Detailed Drug Reports",
          "For each drug with an established PGx guideline, you will find the genes analyzed, your genotype and phenotype, a plain-language explanation of what it means for you, and the clinical recommendation from recognized guidelines."),
         ("Other Evaluated Medications",
-         "Drugs that were analyzed and for which gene data was available, but for which no clear clinical guideline-level recommendation exists for your specific result. These are included for transparency and completeness."),
+         "Drugs that were evaluated but do not have a specific clinical action or recommendation. This occurs either because the genetic data was missing or insufficient (shown as 'Unknown/Unknown'), or because current guidelines do not issue an actionable recommendation for your specific result. These are included for transparency."),
         ("No Guideline Available",
          "Drugs where a relevant gene was identified and partially assessed, but current guidelines do not yet provide specific dosing or management recommendations for this gene-drug combination."),
         ("Genes Requiring Specialized Testing",
@@ -769,7 +769,7 @@ def how_to_read_template(name, pg):
         {_h2("The Difference Between 'No Guideline Available' and 'Other Evaluated Medications'")}
         {_para("These two sections are distinct and should not be confused:")}
         {_para("<strong>No Guideline Available:</strong> The gene was analyzed, a result was obtained, and the gene-drug relationship is known &mdash; but no formal prescribing guideline has been issued yet by CPIC, DPWG, or other recognized bodies for this specific combination. The gene data exists and may become clinically actionable as evidence evolves.")}
-        {_para("<strong>Other Evaluated Medications:</strong> The drug is listed because a potentially relevant gene was assessed, but the genetic data for that gene was either missing entirely (shown as 'Unknown/Unknown' in the diplotype column) or insufficient to generate a result from this dataset. A diplotype of 'Unknown/Unknown' does not represent a normal result &mdash; it means the gene was not evaluable from the submitted file. These entries carry no clinical recommendation.")}
+        {_para("<strong>Other Evaluated Medications:</strong> The drug is listed because it was evaluated against your genetic profile, but no clinical action is currently recommended. This happens for two main reasons: either the genetic data for the relevant gene was missing/insufficient (shown as 'Unknown/Unknown' in the diplotype column), or the current guidelines do not issue an actionable recommendation for your specific genotype. These entries carry no clinical recommendation.")}
 
         {_h2("What Do the Key Terms Mean?")}
         {_para("Each drug entry in the report includes a Genes Analyzed table with three columns. Here is what each one means:")}
@@ -787,7 +787,7 @@ def how_to_read_template(name, pg):
         {_para("Your genotype (the specific variants you carry) was then translated into a phenotype (the functional consequence of those variants) and linked to the appropriate clinical guideline recommendations.")}
 
         {_h2("Guideline Currency")}
-        {_para("Pharmacogenomics guidelines are updated regularly as new evidence is published. The recommendations in this report reflect the versions of the CPIC, DPWG, and FDA guidelines incorporated in the PharmCAT v3.2.0 pipeline at the time of your report generation. For high-stakes prescribing decisions, clinicians may wish to check cpicpgx.org or clinpgx.org directly for the most recent guideline version.")}
+        {_para("Pharmacogenomics guidelines are updated regularly as new evidence is published. The recommendations in this report reflect the versions of the CPIC, DPWG, and FDA guidelines incorporated in the PharmCAT v3.2.0 pipeline at the time this report was generated. For high-stakes prescribing decisions, clinicians may wish to check cpicpgx.org or clinpgx.org directly for the most recent guideline version.")}
 
         <div style="border:1px solid #dc2626; border-left:4px solid #dc2626; border-radius:6px; background:#fef2f2; padding:10px 16px; margin-top:4px; page-break-inside: avoid; break-inside: avoid;">
             <div style="font-size:11.5px; font-weight:700; color:#991b1b; margin-bottom:4px;">Technical Limitations</div>
@@ -1196,7 +1196,7 @@ def doctor_page_template(df, master_genes_df, name, pg):
                     <tr style="background:#f9fafb;">
                         <td style="padding:4px 6px; font-size:11px; font-weight:600; border:1px solid #e5e7eb;">CYP2D6</td>
                         <td style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">Fluoxetine, paroxetine, bupropion, terbinafine, quinidine</td>
-                        <td style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">No commonly used clinically actionable inducer listed</td>
+                        <td style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">None</td>
                     </tr>
                     <tr style="background:#ffffff;">
                         <td style="padding:4px 6px; font-size:11px; font-weight:600; border:1px solid #e5e7eb;">CYP2C19</td>
@@ -1768,8 +1768,11 @@ def coverage_statement_template(patient_name, pg, present_categories):
     for cat in all_categories:
         is_covered = cat.lower() in covered_set
         
-        # Format the category name in Title Case
+        # Format the category name in Title Case and apply manual corrections
         display_cat = cat.title()
+        display_cat = display_cat.replace("In Atc", "In ATC")
+        display_cat = display_cat.replace("Genito Urinary", "Genitourinary")
+        display_cat = display_cat.replace("Antiinfectives", "Anti-infectives")
 
         if is_covered:
             # Green checkmark and bold text

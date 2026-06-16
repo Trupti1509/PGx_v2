@@ -259,7 +259,7 @@ def extract_supplemental_snps(vcf_path: str) -> pd.DataFrame:
     no synthetic row is created and the GSI gap report will note the absence.
     """
     if not os.path.exists(vcf_path):
-        print(f"[WARN] Supplemental SNP extraction: VCF not found at {vcf_path}")
+        # print(f"[WARN] Supplemental SNP extraction: VCF not found at {vcf_path}")
         return pd.DataFrame(columns=["Gene", "Diplotype", "Phenotype", "Activity Score"])
 
     found: dict = {}   # rsid -> gt_code ("00", "01", "11")
@@ -287,13 +287,13 @@ def extract_supplemental_snps(vcf_path: str) -> pd.DataFrame:
             elif gt_field in ("1/1",):
                 found[rsid] = "11"
             else:
-                print(f"[WARN] Supplemental SNP {rsid}: unrecognised GT={gt_field!r}, skipping")
-
+                pass
+                # print(f"[WARN] Supplemental SNP {rsid}: unrecognised GT={gt_field!r}, skipping")
     rows = []
     for rsid, info in SUPPLEMENTAL_RSID_GENES.items():
         if rsid not in found:
             # Not present in VCF — either missing from raw data or not genotyped.
-            print(f"[INFO] Supplemental SNP {rsid} ({info['gene']}) not found in VCF — skipped")
+            # print(f"[INFO] Supplemental SNP {rsid} ({info['gene']}) not found in VCF — skipped")
             continue
         code = found[rsid]
         pheno = info[f"pheno_{code}"]
@@ -304,16 +304,16 @@ def extract_supplemental_snps(vcf_path: str) -> pd.DataFrame:
             "Phenotype":      pheno,
             "Activity Score": "",
         })
-        print(f"[INFO] Supplemental SNP {rsid} -> {info['gene']}  GT={code}  "
-              f"phenotype={pheno!r}")
+        # print(f"[INFO] Supplemental SNP {rsid} -> {info['gene']}  GT={code}  "
+        #       f"phenotype={pheno!r}")
 
     if not rows:
-        print("[INFO] No supplemental SNP rows added (none found in VCF)")
+        # print("[INFO] No supplemental SNP rows added (none found in VCF)")
         return pd.DataFrame(columns=["Gene", "Diplotype", "Phenotype", "Activity Score"])
 
     df = pd.DataFrame(rows)
-    print(f"[INFO] Supplemental SNP rows added: {len(df)} "
-          f"({', '.join(df['Gene'].tolist())})")
+    # print(f"[INFO] Supplemental SNP rows added: {len(df)} "
+    #       f"({', '.join(df['Gene'].tolist())})")
     return df
 
 
@@ -418,7 +418,7 @@ def build_about_lookup(df: pd.DataFrame) -> dict:
         valid = texts[texts.ne("") & texts.str.lower().ne("nan")]
         if not valid.empty:
             lookup[drug] = valid.iloc[0]
-    print(f"[INFO] About lookup: {len(lookup)} unique drugs")
+    # print(f"[INFO] About lookup: {len(lookup)} unique drugs")
     return lookup
 
 def build_witm_lookup(df: pd.DataFrame) -> dict:
@@ -444,7 +444,7 @@ def build_witm_lookup(df: pd.DataFrame) -> dict:
             lookup[gp_key] = witm
     n_drug_keys = sum(1 for k in lookup if isinstance(k, tuple) and k and k[0] == "__drug__")
     n_gp_keys   = len(lookup) - n_drug_keys
-    print(f"[INFO] WITM lookup: {n_drug_keys} drug-specific keys, {n_gp_keys} gene-phenotype fallback keys")
+    # print(f"[INFO] WITM lookup: {n_drug_keys} drug-specific keys, {n_gp_keys} gene-phenotype fallback keys")
     return lookup
 
 def attach_consumer_text(wide: pd.DataFrame, about_lookup: dict, witm_lookup: dict) -> pd.DataFrame:
@@ -484,7 +484,7 @@ def load_and_pivot_gsi(path: str) -> pd.DataFrame:
 
     before = len(df)
     df = df[df["Status"].apply(_is_actionable)].copy()
-    print(f"[INFO] Actionability filter: {before} rows -> {len(df)} rows (excluded 'Not Evaluated' / 'Not Annotated')")
+    # print(f"[INFO] Actionability filter: {before} rows -> {len(df)} rows (excluded 'Not Evaluated' / 'Not Annotated')")
 
     for col in GSI_DETAIL_COLS:
         if col not in df.columns:
@@ -503,7 +503,7 @@ def load_and_pivot_gsi(path: str) -> pd.DataFrame:
     )
 
     if df.empty:
-        print("[WARN] No actionable rows found — check GSI Status column")
+        # print("[WARN] No actionable rows found — check GSI Status column")
         wide = pd.DataFrame(columns=["Gene", "Phenotype", "Drug Name", "Drug Category"])
         wide = attach_consumer_text(wide, about_lookup, witm_lookup)
         return wide
@@ -525,7 +525,7 @@ def load_and_pivot_gsi(path: str) -> pd.DataFrame:
         wide_parts.append(src_df)
 
     if not wide_parts:
-        print("[WARN] No source data found after pivot")
+        # print("[WARN] No source data found after pivot")
         wide = pd.DataFrame(columns=id_cols)
     else:
         wide = wide_parts[0]
@@ -539,7 +539,7 @@ def load_and_pivot_gsi(path: str) -> pd.DataFrame:
                 wide[c] = ""
     wide = wide.fillna("")
 
-    print(f"[INFO] Pivot complete: {len(wide)} unique drug rows from {len(df)} source rows")
+    # print(f"[INFO] Pivot complete: {len(wide)} unique drug rows from {len(df)} source rows")
     wide = attach_consumer_text(wide, about_lookup, witm_lookup)
     return wide
 
@@ -548,7 +548,7 @@ def build_drug_gene_catalog(path: str) -> dict:
         df = pd.read_excel(path, sheet_name=GSI_SHEET)
         df.columns = [c.strip() for c in df.columns]
         if not all(c in df.columns for c in ["Status", "Drug", "Gene"]):
-            print("[WARN] build_drug_gene_catalog: missing required columns")
+            # print("[WARN] build_drug_gene_catalog: missing required columns")
             return {}
         actionable = df[df["Status"].apply(_is_actionable)]
         catalog = (
@@ -556,10 +556,10 @@ def build_drug_gene_catalog(path: str) -> dict:
             .apply(lambda x: sorted(set(x.astype(str).str.strip())))
             .to_dict()
         )
-        print(f"[INFO] Drug-gene catalog: {len(catalog)} drugs with gene associations")
+        # print(f"[INFO] Drug-gene catalog: {len(catalog)} drugs with gene associations")
         return catalog
     except Exception as e:
-        print(f"[WARN] Could not build drug-gene catalog: {e}")
+        # print(f"[WARN] Could not build drug-gene catalog: {e}")
         return {}
 
 _MEANINGFUL_STATUSES_KEYWORDS = {
@@ -696,7 +696,7 @@ def build_all_evaluated_drugs(path: str, patient_genes: set, guided_drug_names_l
         df.columns = [c.strip() for c in df.columns]
         df.rename(columns={"Drug": "Drug Name", "Category": "Drug Category"}, inplace=True)
     except Exception as e:
-        print(f"[WARN] build_all_evaluated_drugs: {e}")
+        # print(f"[WARN] build_all_evaluated_drugs: {e}")
         return pd.DataFrame()
 
     for col in ["Gene", "Drug Name", "Drug Category", "Status"]:
@@ -708,7 +708,7 @@ def build_all_evaluated_drugs(path: str, patient_genes: set, guided_drug_names_l
     mask = (df["Gene"].astype(str).str.strip().str.lower().isin(patient_genes_lower) & df["Status"].apply(_has_meaningful_status))
     sub = df[mask].copy()
     if sub.empty:
-        print("[INFO] build_all_evaluated_drugs: no matching rows found")
+        # print("[INFO] build_all_evaluated_drugs: no matching rows found")
         return pd.DataFrame()
 
     def _simplify_status(status: str) -> str:
@@ -777,7 +777,7 @@ def build_all_evaluated_drugs(path: str, patient_genes: set, guided_drug_names_l
         "NO GROUP ASSIGNED":           "Other",
         "VARIOUS DRUG CLASSES IN ATC": "Other",
     })
-    print(f"[INFO] All Evaluated Drugs: {len(out)} unique drugs across {out['Drug Category'].nunique()} categories")
+    # print(f"[INFO] All Evaluated Drugs: {len(out)} unique drugs across {out['Drug Category'].nunique()} categories")
     return out
 
 def build_specialized_genes_df(step3_geno: pd.DataFrame, scraper_wide: pd.DataFrame) -> pd.DataFrame:
@@ -830,13 +830,13 @@ def format_excel(writer, df, sheet_name):
         ws.write(0, idx, col, head)
 
 def main():
-    print("-" * 65)
-    print(" PGx Pipeline -- Step 4: Multi-Source Merge (CPIC + DPWG + FDA)")
+    # print("-" * 65)
+    # print(" PGx Pipeline -- Step 4: Multi-Source Merge (CPIC + DPWG + FDA)")
     print(f" Catalog: {SCRAPER_FILE}")
-    print("-" * 65)
+    # print("-" * 65)
 
     step3_file = find_latest_step3_master()
-    print(f"[Step3] {step3_file}")
+    # print(f"[Step3] {step3_file}")
 
     base      = os.path.basename(step3_file)
     sample_id = base.removeprefix("step3_").removesuffix("_MASTER.xlsx")
@@ -859,15 +859,16 @@ def main():
     _supp_df  = extract_supplemental_snps(_vcf_path)
     if not _supp_df.empty:
         step3_geno = pd.concat([step3_geno, _supp_df], ignore_index=True)
-        print(f"[INFO] step3_geno after supplemental SNP injection: {len(step3_geno)} rows")
+        # print(f"[INFO] step3_geno after supplemental SNP injection: {len(step3_geno)} rows")
 
     # Build mapping of drugs linked to unanalyzable genes (HLA-B, CYP2D6, etc.)
     # so build_drug_summary can flag them as "further_testing" even when PharmCAT
     # produces no annotation row for the gene-drug pair.
     unanalyzable_drug_map = build_unanalyzable_drug_map(step3_geno)
     if unanalyzable_drug_map:
-        print(f"[INFO] Unanalyzable gene-drug links: {sum(len(v) for v in unanalyzable_drug_map.values())} "
-              f"gene associations across {len(unanalyzable_drug_map)} drugs")
+        pass
+        # print(f"[INFO] Unanalyzable gene-drug links: {sum(len(v) for v in unanalyzable_drug_map.values())} "
+        #       f"gene associations across {len(unanalyzable_drug_map)} drugs")
 
     drug_gene_catalog = build_drug_gene_catalog(SCRAPER_FILE)
     scraper_wide      = load_and_pivot_gsi(SCRAPER_FILE)
@@ -883,12 +884,12 @@ def main():
     _gsi_gene_set = set(scraper_wide["Gene"].astype(str).str.strip())
     _unmatched_gsi_genes = _gsi_gene_set & GSI_ONLY_GENES
     if _unmatched_gsi_genes:
-        print(f"[WARN] GSI contains {len(_unmatched_gsi_genes)} gene(s) PharmCAT never reports "
-              f"as standalone rows — their guidance will NOT be applied: "
-              f"{', '.join(sorted(_unmatched_gsi_genes))}")
+        # print(f"[WARN] GSI contains {len(_unmatched_gsi_genes)} gene(s) PharmCAT never reports "
+        #       f"as standalone rows — their guidance will NOT be applied: "
+        #       f"{', '.join(sorted(_unmatched_gsi_genes))}")
         for _ug in sorted(_unmatched_gsi_genes):
             _ug_drugs = sorted(scraper_wide[scraper_wide["Gene"]==_ug]["Drug Name"].unique())
-            print(f"       {_ug} affects: {', '.join(_ug_drugs[:10])}{'...' if len(_ug_drugs)>10 else ''}")
+            # print(f"       {_ug} affects: {', '.join(_ug_drugs[:10])}{'...' if len(_ug_drugs)>10 else ''}")
 
     left = step3_geno[["Gene", "Diplotype", "Phenotype", "Activity Score"]].copy()
     left["Gene"]           = left["Gene"].astype(str).str.strip()
@@ -934,10 +935,10 @@ def main():
     #   genotype-based genes → "*1/*5", "rs9923231 reference (c)/..." etc.
     merged = pd.merge(left, scraper_wide, on=["Gene", "Phenotype"], how="left")
     _matched = merged["Drug Name"].notna().sum()
-    print(f"[INFO] GSI merge: {_matched}/{len(merged)} patient gene rows matched to GSI entries")
+    # print(f"[INFO] GSI merge: {_matched}/{len(merged)} patient gene rows matched to GSI entries")
     if len(merged) - _matched > 0:
         _unmatched_genes = merged[merged["Drug Name"].isna()]["Gene"].unique().tolist()
-        print(f"       Unmatched genes (phenotype not in GSI): {', '.join(sorted(_unmatched_genes))}")
+        # print(f"       Unmatched genes (phenotype not in GSI): {', '.join(sorted(_unmatched_genes))}")
 
     tmp = merged.copy()
     tmp["Drug"]              = tmp["Drug Name"].astype(str).str.strip().str.lower()
@@ -984,8 +985,8 @@ def main():
             .fillna(merged.loc[still_needs, "Drug Category"])
         )
     else:
-        print(f"[WARN] {DRUG_CAT_SUPPLEMENT} not found — some drugs may remain Uncategorized")
-
+        pass
+        # print(f"[WARN] {DRUG_CAT_SUPPLEMENT} not found — some drugs may remain Uncategorized")
     if "Drug" in merged.columns:
         merged = merged.drop(columns=["Drug"])
 
@@ -1023,7 +1024,7 @@ def main():
                 .map(_about_lookup)
                 .fillna("")
             )
-            print(f"[INFO] Fallback About fill: {blank_about.sum()} rows patched")
+            # print(f"[INFO] Fallback About fill: {blank_about.sum()} rows patched")
 
         blank_witm = _is_blank(merged[witm_std])
         if blank_witm.any():
@@ -1038,10 +1039,10 @@ def main():
                 else:
                     patched.append(_witm_lookup.get((g, p), ""))
             merged.loc[blank_witm, witm_std] = patched
-            print(f"[INFO] Fallback WITM fill: {blank_witm.sum()} rows patched ({sum(1 for x in patched if x)} successful)")
+            # print(f"[INFO] Fallback WITM fill: {blank_witm.sum()} rows patched ({sum(1 for x in patched if x)} successful)")
     except Exception as e:
-        print(f"[WARN] Fallback consumer text pass failed: {e}")
-
+        pass
+        # print(f"[WARN] Fallback consumer text pass failed: {e}")
     for col in STEP5_REQUIRED:
         if col not in merged.columns:
             merged[col] = ""
@@ -1153,23 +1154,25 @@ def main():
                 if col not in _synth_df.columns:
                     _synth_df[col] = ""
             merged = pd.concat([merged, _synth_df[merged.columns]], ignore_index=True)
-            print(f"[INFO] Injected {len(_synth_rows)} synthetic rows for unanalyzable gene-drug pairs")
+            # print(f"[INFO] Injected {len(_synth_rows)} synthetic rows for unanalyzable gene-drug pairs")
 
     zone_counts = merged["Summary Bucket"].value_counts().to_dict()
-    print(f"[INFO] Zone breakdown: "
-          + " | ".join(f"{z}={zone_counts.get(z,0)}" for z in [
-              "action_required", "monitoring", 
-              "further_testing", "standard_use", "no_guideline"]))
+    # print(f"[INFO] Zone breakdown: "
+    #       + " | ".join(f"{z}={zone_counts.get(z,0)}" for z in [
+    #           "action_required", "monitoring", 
+    #           "further_testing", "standard_use", "no_guideline"]))
 
     step3_drugs_set = set(step3_recs["Drug"].astype(str).str.lower().unique()) - {"nan", ""}
     step4_drugs_set = set(merged["Drug Name"].astype(str).str.strip().str.lower().unique()) - {"nan", ""}
     missing_from_step4 = step3_drugs_set - step4_drugs_set
     if missing_from_step4:
-        print(f"[WARN] {len(missing_from_step4)} Step3 drug(s) not in Step4 output:")
+        # print(f"[WARN] {len(missing_from_step4)} Step3 drug(s) not in Step4 output:")
         for d in sorted(missing_from_step4):
-            print(f"       - {d}")
+            pass
+            # print(f"       - {d}")
     else:
-        print("[INFO] Step3/Step4 consistency: all Step3 drugs present in Step4 OK")
+        pass
+        # print("[INFO] Step3/Step4 consistency: all Step3 drugs present in Step4 OK")
 
     final_cols = [
         "Gene", "Diplotype", "Phenotype", "Activity Score", "Drug Name", "Drug Category",
@@ -1240,7 +1243,7 @@ def main():
         axis=1
     )
 
-    print(f"[INFO] Final routing: {drug_summary['Drug Category'].value_counts().to_dict()}")
+    # print(f"[INFO] Final routing: {drug_summary['Drug Category'].value_counts().to_dict()}")
     # ===================================================================
     # BUILD SUPPORTING TABLES
     # ===================================================================
@@ -1259,7 +1262,7 @@ def main():
     # ===================================================================
     os.makedirs(RESULTS_DIR, exist_ok=True)
     out_file = os.path.join(RESULTS_DIR, f"step4_{sample_id}_all_recc.xlsx")
-    print(f"[OUT] {out_file}")
+    # print(f"[OUT] {out_file}")
 
     with pd.ExcelWriter(out_file, engine="xlsxwriter") as writer:
         sheet = "Genotype and All Sources"
@@ -1284,26 +1287,26 @@ def main():
 
     # ── Pipeline gap report ───────────────────────────────────────────────────
     print()
-    print("[PIPELINE COVERAGE NOTES]")
-    print("  rs12777823 : Extracted from step1 VCF.  CPIC reports 'No Recommendation'")
-    print("               for warfarin in African Americans -> zone = No PGx Action Needed.")
-    print("               If absent from a sample's raw data, the gene is skipped.")
-    print("  F2 (rs1799963): Extracted from step1 VCF after supplemental target injection.")
-    print("               Re-run step1 on existing samples to populate this field.")
-    print("  F5 (rs6025) : Same as F2 above.")
-    print("  IFNL3       : Integrated directly into gsi_output.xlsx.")
-    print("  HLA-A/HLA-B : PharmCAT reports 'Indeterminate' (requires specialist HLA")
-    print("               typing). Pipeline correctly shows 'Status Cannot Be Determined'.")
+    # print("[PIPELINE COVERAGE NOTES]")
+    # print("  rs12777823 : Extracted from step1 VCF.  CPIC reports 'No Recommendation'")
+    # print("               for warfarin in African Americans -> zone = No PGx Action Needed.")
+    # print("               If absent from a sample's raw data, the gene is skipped.")
+    # print("  F2 (rs1799963): Extracted from step1 VCF after supplemental target injection.")
+    # print("               Re-run step1 on existing samples to populate this field.")
+    # print("  F5 (rs6025) : Same as F2 above.")
+    # print("  IFNL3       : Integrated directly into gsi_output.xlsx.")
+    # print("  HLA-A/HLA-B : PharmCAT reports 'Indeterminate' (requires specialist HLA")
+    # print("               typing). Pipeline correctly shows 'Status Cannot Be Determined'.")
     print()
 
-    print(f"[OK] Step 4 complete -> {len(merged)} rows, {merged['Drug Name'].nunique()} drugs")
+    # print(f"[OK] Step 4 complete -> {len(merged)} rows, {merged['Drug Name'].nunique()} drugs")
 
     _filled = lambda col: (~merged[col].astype(str).str.strip().isin(["", "nan"])).sum()
     about_filled = _filled("About this medication")
     witm_filled  = _filled("How this gene/phenotype affects the drug and what it means for you")
     total = len(merged)
-    print(f"[QC] About the Medication:  {about_filled}/{total} rows filled ({100*about_filled//total if total else 0}%)")
-    print(f"[QC] What It Means For You: {witm_filled}/{total} rows filled ({100*witm_filled//total if total else 0}%)")
+    # print(f"[QC] About the Medication:  {about_filled}/{total} rows filled ({100*about_filled//total if total else 0}%)")
+    # print(f"[QC] What It Means For You: {witm_filled}/{total} rows filled ({100*witm_filled//total if total else 0}%)")
 
 if __name__ == "__main__":
     main()
