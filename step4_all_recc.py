@@ -4,6 +4,10 @@ import glob
 import re
 import pandas as pd
 
+RS_REGEX_STEP4 = re.compile(r'(?i)^(rs\d+)')
+GSI_FILE_REGEX = re.compile(r"[Gg][Ss][Ii]_\d{2}_\d{2}_\d{2}\.xlsx$")
+PHEN_PREFIX_REGEX = re.compile(r'^[A-Za-z][A-Za-z0-9]+:\s+')
+
 RESULTS_DIR  = "results"
 GSI_SHEET         = "GSI Data"
 
@@ -12,13 +16,11 @@ GSI_SHEET         = "GSI Data"
 #   2. GSI_DD_MM_YY.xlsx — dated snapshots, pick the most recently modified
 #   3. GSI_16_04_26.xlsx — hard fallback if nothing else exists
 def _find_latest_gsi() -> str:
-    import re as _re
     # Priority 1: canonical scraper output file
     if os.path.exists("gsi_output.xlsx"):
         return "gsi_output.xlsx"
     # Priority 2: dated snapshot files
-    pattern = _re.compile(r"[Gg][Ss][Ii]_\d{2}_\d{2}_\d{2}\.xlsx$")
-    candidates = [f for f in glob.glob("GSI_*.xlsx") if pattern.search(f)]
+    candidates = [f for f in glob.glob("GSI_*.xlsx") if GSI_FILE_REGEX.search(f)]
     if candidates:
         return max(candidates, key=os.path.getmtime)
     # Priority 3: hard fallback
@@ -272,8 +274,7 @@ def extract_supplemental_snps(vcf_path: str) -> pd.DataFrame:
                 continue
             rsid_raw = parts[2].strip()
             # Strip any suffix and force case-insensitive match (catches RS12777823)
-            import re as _re_step4
-            _m = _re_step4.match(r'(?i)^(rs\d+)', rsid_raw)
+            _m = RS_REGEX_STEP4.match(rsid_raw)
             rsid = _m.group(1).lower() if _m else rsid_raw.lower()
             
             if rsid not in SUPPLEMENTAL_RSID_GENES:
@@ -427,7 +428,7 @@ def build_witm_lookup(df: pd.DataFrame) -> dict:
         return {}
     drug_col = "Drug Name" if "Drug Name" in df.columns else "Drug"
     lookup = {}
-    for _, row in df.iterrows():
+    for row in df.to_dict("records"):
         gene      = str(row.get("Gene", "")).strip()
         phenotype = str(row.get("Phenotype", "")).strip()
         drug      = str(row.get(drug_col, "")).strip().lower()
@@ -597,7 +598,7 @@ def build_unanalyzable_drug_map(step3_geno: pd.DataFrame) -> dict:
     if "Related Drugs" not in step3_geno.columns:
         return drug_map
 
-    for _, row in step3_geno.iterrows():
+    for row in step3_geno.to_dict("records"):
         gene = str(row.get("Gene", "")).strip()
         if gene.lower() not in unanalyzable_genes:
             continue
@@ -722,12 +723,11 @@ def build_all_evaluated_drugs(path: str, patient_genes: set, guided_drug_names_l
         order = {"Has Guidance": 0, "No Specific Action": 1, "No Action": 2}
         return min(statuses, key=lambda s: order.get(s, 99))
 
-    import re as _re
     def _norm_phen(phen: str) -> str:
         # Strip a leading "GENE: " or "gene: " prefix (e.g. "CYP2C9: Normal Metabolizer"),
         # then lowercase.  The "(AS:x.x)" activity-score suffix is intentionally kept so
         # that IM(1.0) and IM(1.5) are treated as distinct phenotypes when matching.
-        p = _re.sub(r'^[A-Za-z][A-Za-z0-9]+:\s+', '', str(phen).strip())
+        p = PHEN_PREFIX_REGEX.sub('', str(phen).strip())
         return p.strip().lower()
 
     patient_phen_norm: dict = {}

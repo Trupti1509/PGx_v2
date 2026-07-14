@@ -127,7 +127,7 @@ def _load_therapeutic_category_map() -> dict:
             if not drug_col or not cat_col:
                 continue
             mapping = {}
-            for _, row in gsi.iterrows():
+            for row in gsi.to_dict("records"):
                 drug = str(row.get(drug_col, "")).strip().lower()
                 category = str(row.get(cat_col, "")).strip()
                 if drug and category and category.lower() not in {"nan", "none"}:
@@ -267,7 +267,7 @@ def load_drug_gene_catalog(step4_path: str) -> dict:
         df = pd.read_excel(step4_path, sheet_name="Drug Gene Catalog")
         df.columns = [c.strip() for c in df.columns]
         catalog = {}
-        for _, row in df.iterrows():
+        for row in df.to_dict("records"):
             drug = str(row.get("Drug Name", "")).strip().lower()
             genes_str = str(row.get("Genes", "")).strip()
             if drug and genes_str and genes_str.lower() != "nan":
@@ -397,7 +397,7 @@ def load_master_data(sample_id):
         genes_col = next((c for c in recs_df.columns if str(c).strip().lower() in ["gene", "genes"]), None)
 
         if drug_col and genes_col:
-            for _, row in recs_df.iterrows():
+            for row in recs_df.to_dict("records"):
                 d     = str(row[drug_col]).strip().lower()
                 g_str = str(row[genes_col]).strip()
                 if d and d != "nan" and g_str and g_str != "nan":
@@ -521,7 +521,7 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
         # For each gene row, check if it's either "no recommendation" or
         # "requires specialized testing" (uncertain phenotype)
         all_rows_no_guidance = True
-        for _, row in rows.iterrows():
+        for row in rows.to_dict("records"):
             pheno = str(row.get("Phenotype", "")).strip().lower()
             # If gene has uncertain phenotype → requires specialized testing, skip it
             if pheno in _uncertain_phenotypes:
@@ -722,7 +722,7 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
                     demoted.append(dd)
                     continue
 
-                for _, r in rec_rows.iterrows():
+                for r in rec_rows.to_dict("records"):
                     # Only consider recommendation rows that contain meaningful guidance
                     raw_rec_text = str(r.get("Recommendation", "") or "").strip()
                     rec_lower = raw_rec_text.lower()
@@ -744,7 +744,7 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
                     rec_as = r.get("Activity Score", None)
 
                     # iterate observed rows and attempt match
-                    for _, o in obs.iterrows():
+                    for o in obs.to_dict("records"):
                         ogene = str(o.get("Gene", "") or "").strip().lower()
                         odip = str(o.get("Diplotype", "") or "").strip().lower()
                         ophen = _norm_pheno(o.get("Phenotype", "") or "")

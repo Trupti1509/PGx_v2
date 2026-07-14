@@ -3,7 +3,10 @@
 import os
 import sys
 import time
+import re
 from datetime import datetime
+
+RS_REGEX = re.compile(r'^(rs\d+)')
 
 PHARMCAT_VCF = "pharmcat_data/pharmcat_positions_3.2.0.vcf"
 OUTPUT_DIR = "results"
@@ -150,8 +153,7 @@ def parse_raw_line(line):
     rsid = None
     for p in parts:
         if p.startswith("rs") and "_" not in p and ":" not in p:
-            import re as _re_step1
-            _m = _re_step1.match(r'^(rs\d+)', p)
+            _m = RS_REGEX.match(p)
             if _m:
                 rsid = _m.group(1)
             break
@@ -166,6 +168,10 @@ def parse_raw_line(line):
             x, y = gt_field.split("/")
             if len(x) == 1 and len(y) == 1 and x.isalpha() and y.isalpha():
                 a1, a2 = x, y
+        elif len(parts) >= 5:
+            c3, c4 = parts[3].upper(), parts[4].upper()
+            if len(c3) == 1 and len(c4) == 1 and c3.isalpha() and c4.isalpha():
+                a1, a2 = c3, c4
 
     if a1 is None:
         last = parts[-1].upper()
@@ -173,11 +179,6 @@ def parse_raw_line(line):
             a1, a2 = last[0], last[1]
         elif len(last) == 1 and last.isalpha():
             a1 = a2 = last
-
-    if a1 is None and len(parts) >= 5:
-        c3, c4 = parts[3].upper(), parts[4].upper()
-        if len(c3) == 1 and len(c4) == 1 and c3.isalpha() and c4.isalpha():
-            a1, a2 = c3, c4
 
     if not _valid_alleles(a1, a2):
         return None, None, None
@@ -255,10 +256,7 @@ def convert_raw_to_vcf(raw_path, meta_lines, targets, out_path, sample_id):
             out.write(f"{m['chrom']}\t{m['pos']}\t{m['id']}\t{m['ref']}\t{m['alt']}\t.\tPASS\t.\tGT\t{m['gt']}\n")
 
     elapsed = time.time() - t0
-    # print("[INFO] Step 1 complete")
-    # print(f"[INFO] Processing time: {elapsed:.1f} s")
-    # print(f"[INFO] Variants written: {len(matches)}")
-    # print(f"[INFO] Output VCF: {out_path}")
+
 
 def run_step1(raw_path: str):
     if not os.path.exists(raw_path):

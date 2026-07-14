@@ -362,8 +362,8 @@ def load_cpic_loe(path):
         elif "cpic publications" in cl: rename[c] = "CPIC PMIDs"
     df = df.rename(columns=rename)
 
-    df["_d"] = df["Drug"].map(norm_drug)
-    df["_g"] = df["Gene"].map(norm_gene)
+    df["_d"] = df["Drug"].fillna("").astype(str).str.strip().str.lower()
+    df["_g"] = df["Gene"].fillna("").astype(str).str.strip().str.upper()
 
     cols = ["_d", "_g", "CPIC Level", "PharmGKB LoE", "PGx on FDA Label", "CPIC Guideline URL", "CPIC PMIDs"]
     cols = [c for c in cols if c in df.columns]
@@ -374,8 +374,8 @@ def attach_evidence(df_recs, loe):
         return df_recs
 
     out = df_recs.copy()
-    out["_d"] = out["Drug"].map(norm_drug)
-    out["_g"] = out["Gene"].map(norm_gene)
+    out["_d"] = out["Drug"].fillna("").astype(str).str.strip().str.lower()
+    out["_g"] = out["Gene"].fillna("").astype(str).str.strip().str.upper()
 
     merged = out.merge(loe, how="left", on=["_d", "_g"]).drop(columns=["_d", "_g"], errors="ignore")
 

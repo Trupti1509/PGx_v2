@@ -2140,7 +2140,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
         """
         clf_priority = {"strong": 0, "moderate": 1, "optional": 2}
         candidates = []
-        for _, r in rows.iterrows():
+        for r in rows.to_dict("records"):
             clf   = str(r.get("Classification", "")).strip().lower()
             rec   = str(r.get("Recommendation", "")).strip()
             pheno = str(r.get("Phenotype", "")).strip()
@@ -2268,7 +2268,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
 
     # ── Separation: PharmCAT-analysed vs GSI-catalog-only ────────────────────
     genes_from_rows = set()
-    for _, row in drug_rows.iterrows():
+    for row in drug_rows.to_dict("records"):
         raw_g = _safe(row.get('Gene', ''))
         for sep in [';', '\n', ',']:
             if sep in raw_g:
@@ -2347,7 +2347,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
                 gene_pheno_map[g]  = [("—", "—")]
             else:
                 pheno_dict = {}
-                for _, m_row in match.iterrows():
+                for m_row in match.to_dict("records"):
                     raw_d = _safe(m_row.get('Diplotype', '')) or '—'
                     raw_p = _safe(m_row.get('Phenotype', '')) or 'No data available'
                     if ":" in raw_p and raw_p.lower().startswith(g.lower()):
@@ -2516,7 +2516,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
     # still matches.
     _patient_phen_per_gene = {}
     if master_genes_df is not None and not master_genes_df.empty:
-        for _, _mr in master_genes_df.iterrows():
+        for _mr in master_genes_df.to_dict("records"):
             _g_raw = str(_mr.get("Gene", "")).strip()
             _p_raw = str(_mr.get("Phenotype", "")).strip()
             if not _g_raw:
@@ -2713,7 +2713,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
 
     # --- 2. ABOUT THIS MEDICATION ---
     about = ""
-    for _, r in drug_rows.iterrows():
+    for r in drug_rows.to_dict("records"):
         if not about:
             about = _safe(r.get('About this medication', ''))
     about = about or 'No description available.'
@@ -2786,7 +2786,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
 
                 for individual_p in individual_phenos:
                     how_text = ""
-                    for _, dr in drug_rows.iterrows():
+                    for dr in drug_rows.to_dict("records"):
                         dr_gene  = _safe(dr.get('Gene', ''))
                         dr_pheno = _safe(dr.get('Phenotype', ''))
                         if ":" in dr_pheno and dr_pheno.lower().startswith(dr_gene.lower()):
@@ -2796,7 +2796,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
                             if how_text: break
 
                     if not how_text:
-                        for _, dr in drug_rows.iterrows():
+                        for dr in drug_rows.to_dict("records"):
                             if _safe(dr.get('Gene', '')).lower() == g.lower():
                                 how_text = _safe(dr.get('How this gene/phenotype affects the drug and what it means for you', ''))
                                 if how_text: break
@@ -2810,7 +2810,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
                     # Prevent 'refer to guideline' placeholder if gene truly has no recommendation
                     if "refer to guideline" in how_text.lower() or "refer to recommendation" in how_text.lower():
                         gene_has_rec = False
-                        for _, dr_rec in drug_rows.iterrows():
+                        for dr_rec in drug_rows.to_dict("records"):
                             rg = _safe(dr_rec.get('Gene', ''))
                             rt = _safe(dr_rec.get('Recommendation', ''))
                             if rg.lower() == g.lower() and rt and not _is_placeholder_rec(rt):
@@ -2873,7 +2873,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
     # --- 4. RECOMMENDATIONS ---
     ev_parts = []
     for label, col in [('CPIC', 'CPIC Level'), ('PharmGKB', 'PharmGKB LoE'), ('FDA', 'PGx on FDA Label')]:
-        for _, r in drug_rows.iterrows():
+        for r in drug_rows.to_dict("records"):
             v = _safe(r.get(col, ''))
             if v:
                 ev_parts.append(f'<span style="background:#f3f4f6; border:1px solid #e5e7eb; color:#4b5563; padding:2px 6px; border-radius:4px; font-size:12px; font-weight:600; margin-left:4px;">{label}: {v}</span>')
@@ -2911,7 +2911,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
 
     _src_statuses = {}
     for _src in ['CPIC', 'DPWG', 'FDA_Label', 'FDA_Table']:
-        for _, _r in drug_rows.iterrows():
+        for _r in drug_rows.to_dict("records"):
             _sv = _safe(_r.get(f'{_src} Status', ''))
             if _sv:
                 _src_statuses[_src] = _sv
@@ -2938,7 +2938,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
 
     # Loop through all sources independently—keeping 1, 2, 3, or all 4 guidelines if present
     for source in ['CPIC', 'DPWG', 'FDA_Label', 'FDA_Table']:
-        for _, r in drug_rows.iterrows():
+        for r in drug_rows.to_dict("records"):
             # GSI schema: single Details column; fallback to old column names for compatibility
             details = _safe(r.get(f'{source} Details', ''))
             rec     = _safe(r.get(f'{source} Recommendation', ''))   # PharmCAT / legacy
@@ -3134,7 +3134,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
     # there IS actionable guidance.
     if not all_recs:
         _pharmcat_style = {'text': '#6b21a8', 'bg': '#faf5ff', 'border': '#d8b4fe'}
-        for _, r in drug_rows.iterrows():
+        for r in drug_rows.to_dict("records"):
             g = _safe(r.get('Gene', ''))
             if g and g.lower() in _spec_testing_genes_lower:
                 continue
@@ -3182,7 +3182,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
         )
 
     urls, citations = "", ""
-    for _, r in drug_rows.iterrows():
+    for r in drug_rows.to_dict("records"):
         if not urls:      urls      = _safe(r.get('URLs', ''))
         if not citations: citations = _safe(r.get('citation links', ''))
 
@@ -3420,7 +3420,7 @@ def other_evaluated_medicines_template(df, name, pg, master_genes_df, drug_gene_
         
         genes_from_map = set(drug_gene_map.get(drug_key, [])) if drug_gene_map else set()
         genes_from_rows = set()
-        for _, row in drug_rows.iterrows():
+        for row in drug_rows.to_dict("records"):
             raw_g = _safe(row.get('Gene',''))
             for sep in [';', '\n', ',']:
                 if sep in raw_g:
@@ -3438,7 +3438,7 @@ def other_evaluated_medicines_template(df, name, pg, master_genes_df, drug_gene_
                 match = master_genes_df[master_genes_df['Gene'].str.lower() == g.lower()]
                 if not match.empty:
                     gene_phenos = {}
-                    for _, m_row in match.iterrows():
+                    for m_row in match.to_dict("records"):
                         raw_d = _safe(m_row.get('Diplotype', '-'))
                         raw_p = _safe(m_row.get('Phenotype', 'No data available'))
                         
@@ -3655,7 +3655,7 @@ def panel_coverage_template(all_drugs_df, detail_drug_pages, name, pg):
             </td>
         </tr>"""
 
-        for _, row in cat_grp.iterrows():
+        for row in cat_grp.to_dict("records"):
             drug_name  = str(row.get("Drug Name", "")).strip().title()
             genes_str  = str(row.get("Genes", "")).strip()
             badge_html = _status_badge(row)
@@ -3736,7 +3736,7 @@ def genotype_summary_template(df, name, pg, qc_df=None):
     gene_activity = {}  # gene → activity score (for display alongside phenotype)
     if not df.empty:
         df = df.sort_values('Gene', na_position='last')
-        for _, row in df.iterrows():
+        for row in df.to_dict("records"):
             g = str(row.get('Gene', '')).strip()
             d = str(row.get('Diplotype', '')).strip()
             # Prefer PharmCAT Phenotype (original from report) over the GSI-merge key
@@ -3877,7 +3877,7 @@ def genotype_summary_template(df, name, pg, qc_df=None):
             "gene is on the ne",
         )
 
-        for _, qr in qc_df.iterrows():
+        for qr in qc_df.to_dict("records"):
             gene = str(qr.get("Gene", "")).strip()
             if not gene or gene.lower() in _BAD_QC or gene in per_gene:
                 continue
@@ -4005,7 +4005,7 @@ def pharmcat_no_guidance_template(coverage_df, patient_name, pg):
 
     valid_rows = []
     if coverage_df is not None and not coverage_df.empty:
-        for _, row in coverage_df.sort_values("Drug Name").iterrows():
+        for row in coverage_df.sort_values("Drug Name").to_dict("records"):
             drug     = str(row.get("Drug Name", "")).strip()
             category = str(row.get("Drug Category", "")).strip()
             if not drug or drug.lower() in ("nan", ""):
@@ -4318,7 +4318,7 @@ def specialized_genes_template(df, name, pg):
         return s if s.lower() not in ('', 'nan', 'none', 'n/a') else ''
 
     gene_data = {}
-    for _, row in df.iterrows():
+    for row in df.to_dict("records"):
         gene = _safe(row.get("Gene", ""))
         if not gene: continue
         raw_reason = _safe(row.get("Cannot Analyze Reason", ""))
