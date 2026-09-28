@@ -7,15 +7,15 @@ import re
 from datetime import datetime
 
 RS_REGEX = re.compile(r'^(rs\d+)')
+PGX_VERBOSE = os.environ.get("PGX_VERBOSE", "0").lower() not in {"0", "false", "no", "off"}
 
 PHARMCAT_VCF = "pharmcat_data/pharmcat_positions_3.2.0.vcf"
 OUTPUT_DIR = "results"
 
-# ── Supplemental SNPs (not in pharmcat_positions.vcf) ─────────────────────────
-# These are clinically relevant PGx variants that PharmCAT does not track but
-# that appear in consumer DNA raw files.  They are extracted alongside PharmCAT
-# targets, written to the step1 VCF, and later read by step4 to build synthetic
-# gene rows for the GSI merge.
+
+def log(msg, *args, **kwargs):
+    if PGX_VERBOSE:
+        print(msg, *args, **kwargs)
 
 SUPPLEMENTAL_SNPS: dict = {
     "rs1799963": {"chrom": "chr11", "pos": 46761055, "ref": "G", "alt": "A"},
@@ -51,7 +51,6 @@ def _is_header_or_meta(s: str) -> bool:
     return False
 
 def load_pharmcat_positions(path):
-    # print(f"[INFO] Loading PharmCAT reference: {path}")
     if not os.path.exists(path):
         bgz = os.path.join(
             os.path.dirname(path) or ".",
@@ -91,9 +90,6 @@ def load_pharmcat_positions(path):
                         "alt": alt,
                     }
 
-    # print(f"[INFO] Loaded {len(targets)} PharmCAT target rsIDs from {path}")
-
-    # Inject supplemental SNPs that are not tracked by PharmCAT but are needed
     added = []
     for rsid, info in SUPPLEMENTAL_SNPS.items():
         if rsid not in targets:
@@ -101,7 +97,6 @@ def load_pharmcat_positions(path):
             added.append(rsid)
     if added:
         pass
-        # print(f"[INFO] Injected {len(added)} supplemental SNP(s) into target list: {', '.join(added)}")
     return meta_lines, targets
 
 def compute_vcf_gt(a1, a2, ref, alt_str):
@@ -186,6 +181,8 @@ def parse_raw_line(line):
     return rsid, a1, a2
 
 def _print_progress(fh, size, total_lines, matched):
+    if not PGX_VERBOSE:
+        return
     pct = (fh.tell() / size) * 100 if size > 0 else 0
     sys.stdout.write(f"\r[PROGRESS] {pct:5.1f}%  lines={total_lines}  matches={matched}")
     sys.stdout.flush()

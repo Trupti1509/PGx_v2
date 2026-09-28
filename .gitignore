@@ -1,3 +1,27 @@
+# Environments
+.venv/
 venv/
-temp/
+ENV/
+env/
+
+# Node dependencies
+node_modules/
+
+# Python cache
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Logs & temp
+*.log
+temp/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment variables
+.env
+.env.local

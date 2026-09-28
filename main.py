@@ -4,8 +4,11 @@ import argparse
 from pathlib import Path
 import os
 
+os.environ.setdefault("PGX_VERBOSE", "0")
+
 import step1_convert_rawdna_to_vcf as step1
 import step2_pharmcat as step2
+import step2b_warfarin_input as warfarin_input
 import step3_json_to_summary as step3
 import step4_all_recc as step4
 import step5_drug_wise_xcode as step5
@@ -21,7 +24,6 @@ def derive_sample_id(vcf_path: str) -> str:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("raw_input")
-    # Made --name a required argument, removed the hardcoded default
     parser.add_argument("--name", required=True, metavar="PATIENT_NAME", help='Patient name for the report. Example: --name "John Smith"')
     args = parser.parse_args()
 
@@ -33,37 +35,55 @@ def main():
     patient_name = args.name.strip()
     sample_basename = raw_path.stem
     step1_vcf_path = Path("results") / f"step1_{sample_basename}.vcf"
+    verbose = os.environ.get("PGX_VERBOSE", "0").lower() not in {"0", "false", "no", "off"}
 
-    print(f"[INFO] Patient name: {patient_name}")
+    if verbose:
+        print(f"[INFO] Patient name: {patient_name}")
+    else:
+        print(f"Generating report for: {patient_name}")
 
-    print("\n--- Step 1 (Convert raw DNA to VCF) ---")
+    print("[STEP 1/5] Raw DNA -> VCF")
     step1.run_step1(str(raw_path))
 
     if not step1_vcf_path.exists():
-        print(f" Step 1 failed: VCF not created at {step1_vcf_path}")
+        print(f"[STEP 1/5] Failed: VCF not created at {step1_vcf_path}")
         sys.exit(1)
+    print(f"  Done: {step1_vcf_path}")
 
     sample_id = derive_sample_id(str(step1_vcf_path))
-    print(f"[INFO] Sample ID for PharmCAT: {sample_id}")
 
-    print("\n--- Step 2 (Run PharmCAT) ---")
+    print("[STEP 2/5] PharmCAT analysis")
     step2.run_pharmcat(str(step1_vcf_path), sample_id)
+    pharmcat_json_path = Path("results") / "reports" / f"{sample_id}.report.json"
+    print(f"  Done: {pharmcat_json_path}")
 
-    print("\n--- Step 3 (JSON to summary Excel) ---")
+    print("[STEP 2b/5] Warfarin input")
+    warfarin_csv_path = warfarin_input.generate_warfarin_csv(
+        vcf_path=str(step1_vcf_path),
+        pharmcat_json_path=str(pharmcat_json_path),
+        sample_id=sample_id,
+    )
+    print(f"  Done: {warfarin_csv_path}")
+
+    print("[STEP 3/5] Summary generation")
     step3.main([])
+    print("  Done: summary data prepared")
 
-    print("\n--- Step 4 (Add all sources recommendations) ---")
+    print("[STEP 4/5] Recommendation merge")
     step4.main()
+    print("  Done: recommendation catalog ready")
 
-    print("\n--- Step 5 (Final PDF report) ---")
-    # Pass sample_id so step5 pins to the correct step4 file and avoids
-    # picking a neighbour's output when multiple samples exist in results/.
-    step5.main(patient_name=patient_name, sample_id=sample_id)
+    print("[STEP 5/5] Final report generation")
+    pdf_path = step5.main(patient_name=patient_name, sample_id=sample_id, show_summary=False)
 
-    print("\n" + "="*70)
-    print(" All steps completed successfully!")
-    print("Final PDF saved in: results/reports_drugwise_pdf/")
-    print("="*70)
+    if pdf_path:
+        timestamp = Path(pdf_path).stem.replace("report_final_", "")
+        final_html = str(Path("results") / "reports_drugwise_pdf" / f"report_content_{timestamp}.html")
+        print(f"PDF: {pdf_path}")
+        print(f"HTML: {final_html}")
+        print("STATUS: COMPLETE")
+    else:
+        print("[STEP 5/5] Failed: report generation failed.")
 
 if __name__ == "__main__":
     main()

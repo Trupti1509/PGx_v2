@@ -378,94 +378,241 @@ def load_step3_citations(path: str) -> dict:
     )
 
 def _simplify_phenotype(phenotype: str) -> str:
+    """Normalize phenotype text for GSI consumer-text lookup keys.
+
+    Important: preserve clinically distinct labels such as
+    "Possible Decreased Function" separately from "Decreased Function".
+    """
     if not phenotype or str(phenotype).strip().lower() in ("", "nan"):
         return "indeterminate"
+
     p = str(phenotype).lower().strip()
+
     if "aminoglycoside" in p:
-        if "increased risk" in p: return "hearing_loss_high"
-        if "normal risk" in p: return "hearing_loss_normal"
-        if "uncertain risk" in p: return "hearing_loss_uncertain"
-    if "malignant hyperthermia susceptibility" in p: return "mh_susceptible"
-    if "uncertain susceptibility" in p: return "mh_uncertain"
-    if "ivacaftor non-responsive" in p: return "ivacaftor_nonresponsive"
-    if "ivacaftor responsive" in p and "non" not in p: return "ivacaftor_responsive"
-    if "deficient with cnsha" in p: return "g6pd_deficient_severe"
-    if "deficient" in p: return "g6pd_deficient"
-    if "variable" in p: return "variable"
-    if "ultrarapid" in p: return "ultrarapid_metabolizer"
-    if "rapid" in p: return "rapid_metabolizer"
-    if "likely poor" in p: return "likely_poor_metabolizer"
-    if "likely intermediate" in p or "possible intermediate" in p: return "likely_intermediate_metabolizer"
-    if "poor metabolizer" in p or "poor function" in p: return "poor"
-    if "intermediate metabolizer" in p or "intermediate" in p: return "intermediate"
-    if "normal" in p: return "normal"
-    if "decreased function" in p: return "decreased_function"
-    if "increased function" in p: return "increased_function"
-    if "indeterminate" in p: return "indeterminate"
-    
+        if "increased risk" in p:
+            return "hearing_loss_high"
+        if "normal risk" in p:
+            return "hearing_loss_normal"
+        if "uncertain risk" in p:
+            return "hearing_loss_uncertain"
+
+    if "malignant hyperthermia susceptibility" in p:
+        return "mh_susceptible"
+    if "uncertain susceptibility" in p:
+        return "mh_uncertain"
+    if "ivacaftor non-responsive" in p:
+        return "ivacaftor_nonresponsive"
+    if "ivacaftor responsive" in p and "non" not in p:
+        return "ivacaftor_responsive"
+    if "deficient with cnsha" in p:
+        return "g6pd_deficient_severe"
+    if "deficient" in p:
+        return "g6pd_deficient"
+    if "variable" in p:
+        return "variable"
+
+    # Preserve specific function categories BEFORE generic substring matches.
+    if "possible decreased function" in p:
+        return "possible_decreased_function"
+    if "possible increased function" in p:
+        return "possible_increased_function"
+    if "likely decreased function" in p:
+        return "likely_decreased_function"
+    if "likely increased function" in p:
+        return "likely_increased_function"
+
+    if "ultrarapid" in p:
+        return "ultrarapid_metabolizer"
+    if "rapid" in p:
+        return "rapid_metabolizer"
+    if "likely poor" in p:
+        return "likely_poor_metabolizer"
+    if "likely intermediate" in p or "possible intermediate" in p:
+        return "likely_intermediate_metabolizer"
+    if "poor metabolizer" in p or "poor function" in p:
+        return "poor"
+    if "intermediate metabolizer" in p or "intermediate" in p:
+        return "intermediate"
+    if "decreased function" in p:
+        return "decreased_function"
+    if "increased function" in p:
+        return "increased_function"
+    if "normal" in p:
+        return "normal"
+    if "indeterminate" in p:
+        return "indeterminate"
+
     if ";" in p:
         p = p.split(";")[0].strip()
-        
+
     return p.replace(" ", "_")
 
+def _norm_lookup_text(value) -> str:
+    """Normalize drug/category/gene text used only for lookup keys."""
+    s = str(value or "").strip()
+    if s.lower() in {"", "nan", "none", "n/a"}:
+        return ""
+    return re.sub(r"\s+", " ", s).lower()
+
+
+def _detect_category_col(df: pd.DataFrame):
+    for col in ("Drug Category", "Therapeutic Category", "Category"):
+        if col in df.columns:
+            return col
+    return None
+
+
 def build_about_lookup(df: pd.DataFrame) -> dict:
+    """Build category-aware About-the-Medication lookup.
+
+    Exact key:
+        ("__drug_category__", drug, category)
+
+    Safe fallback:
+        ("__drug__", drug)
+
+    The drug-only fallback is created ONLY when every non-empty category row for
+    that drug has the same About text.
+    """
     about_col = "About the Medication"
     if about_col not in df.columns:
         return {}
+
     drug_col = "Drug Name" if "Drug Name" in df.columns else "Drug"
+    category_col = _detect_category_col(df)
+
     lookup = {}
-    for drug, grp in df.groupby(df[drug_col].astype(str).str.strip().str.lower()):
-        texts = grp[about_col].astype(str).str.strip()
-        valid = texts[texts.ne("") & texts.str.lower().ne("nan")]
-        if not valid.empty:
-            lookup[drug] = valid.iloc[0]
-    # print(f"[INFO] About lookup: {len(lookup)} unique drugs")
+    per_drug_texts = {}
+
+    for row in df.to_dict("records"):
+        drug = _norm_lookup_text(row.get(drug_col, ""))
+        category = _norm_lookup_text(row.get(category_col, "")) if category_col else ""
+        text = str(row.get(about_col, "") or "").strip()
+
+        if not drug or not text or text.lower() in {"nan", "none"}:
+            continue
+
+        if category:
+            exact_key = ("__drug_category__", drug, category)
+            lookup.setdefault(exact_key, text)
+
+        per_drug_texts.setdefault(drug, [])
+        if text not in per_drug_texts[drug]:
+            per_drug_texts[drug].append(text)
+
+    for drug, texts in per_drug_texts.items():
+        if len(texts) == 1:
+            lookup[("__drug__", drug)] = texts[0]
+
     return lookup
 
+
 def build_witm_lookup(df: pd.DataFrame) -> dict:
+    """Build category-aware What-It-Means-For-You lookup.
+
+    Exact key:
+        ("__drug_category__", drug, category, gene, phenotype_key)
+
+    Safe fallback:
+        ("__drug__", drug, gene, phenotype_key)
+
+    The drug-level fallback is created ONLY when the same drug/gene/phenotype
+    has exactly one authored WITM text across its categories.
+
+    A global (gene, phenotype) fallback is intentionally not used because it
+    can copy wording written for one medication into a different medication.
+    """
     witm_col = "What It Means For You"
     if witm_col not in df.columns:
         return {}
+
     drug_col = "Drug Name" if "Drug Name" in df.columns else "Drug"
+    category_col = _detect_category_col(df)
+
     lookup = {}
+    per_drug_context_texts = {}
+
     for row in df.to_dict("records"):
-        gene      = str(row.get("Gene", "")).strip()
-        phenotype = str(row.get("Phenotype", "")).strip()
-        drug      = str(row.get(drug_col, "")).strip().lower()
-        witm      = str(row.get(witm_col, "")).strip()
-        if not gene or not witm or witm.lower() == "nan":
+        gene = str(row.get("Gene", "") or "").strip().upper()
+        phenotype = str(row.get("Phenotype", "") or "").strip()
+        drug = _norm_lookup_text(row.get(drug_col, ""))
+        category = _norm_lookup_text(row.get(category_col, "")) if category_col else ""
+        witm = str(row.get(witm_col, "") or "").strip()
+
+        if not drug or not gene or not witm or witm.lower() in {"nan", "none"}:
             continue
+
         sp = _simplify_phenotype(phenotype)
-        if drug:
-            drug_key = ("__drug__", drug, gene, sp)
-            if drug_key not in lookup:
-                lookup[drug_key] = witm
-        gp_key = (gene, sp)
-        if gp_key not in lookup:
-            lookup[gp_key] = witm
-    n_drug_keys = sum(1 for k in lookup if isinstance(k, tuple) and k and k[0] == "__drug__")
-    n_gp_keys   = len(lookup) - n_drug_keys
-    # print(f"[INFO] WITM lookup: {n_drug_keys} drug-specific keys, {n_gp_keys} gene-phenotype fallback keys")
+
+        if category:
+            exact_key = ("__drug_category__", drug, category, gene, sp)
+            lookup.setdefault(exact_key, witm)
+
+        fallback_context = (drug, gene, sp)
+        per_drug_context_texts.setdefault(fallback_context, [])
+        if witm not in per_drug_context_texts[fallback_context]:
+            per_drug_context_texts[fallback_context].append(witm)
+
+    for (drug, gene, sp), texts in per_drug_context_texts.items():
+        if len(texts) == 1:
+            lookup[("__drug__", drug, gene, sp)] = texts[0]
+
     return lookup
 
+
 def attach_consumer_text(wide: pd.DataFrame, about_lookup: dict, witm_lookup: dict) -> pd.DataFrame:
+    """Attach category-specific About and WITM text to pivoted GSI rows."""
     about_std = "About this medication"
-    witm_std  = "How this gene/phenotype affects the drug and what it means for you"
-    wide["_drug_key"]  = wide["Drug Name"].astype(str).str.strip().str.lower()
-    wide[about_std]    = wide["_drug_key"].map(about_lookup).fillna("")
+    witm_std = "How this gene/phenotype affects the drug and what it means for you"
+
+    if wide.empty:
+        if about_std not in wide.columns:
+            wide[about_std] = ""
+        if witm_std not in wide.columns:
+            wide[witm_std] = ""
+        return wide
+
+    wide = wide.copy()
+    wide["_drug_key"] = wide["Drug Name"].astype(str).apply(_norm_lookup_text)
+
+    category_col = _detect_category_col(wide)
+    if category_col:
+        wide["_category_key"] = wide[category_col].astype(str).apply(_norm_lookup_text)
+    else:
+        wide["_category_key"] = ""
+
     wide["_pheno_key"] = wide["Phenotype"].astype(str).apply(_simplify_phenotype)
-    wide["_gene_key"]  = wide["Gene"].astype(str).str.strip()
+    wide["_gene_key"] = wide["Gene"].astype(str).str.strip().str.upper()
+
+    def _pick_about(row):
+        exact = ("__drug_category__", row["_drug_key"], row["_category_key"])
+        if row["_category_key"] and exact in about_lookup:
+            return about_lookup[exact]
+        return about_lookup.get(("__drug__", row["_drug_key"]), "")
 
     def _pick_witm(row):
-        drug_specific = ("__drug__", row["_drug_key"], row["_gene_key"], row["_pheno_key"])
-        if drug_specific in witm_lookup:
-            return witm_lookup[drug_specific]
-        gp_fallback = (row["_gene_key"], row["_pheno_key"])
-        return witm_lookup.get(gp_fallback, "")
+        exact = (
+            "__drug_category__",
+            row["_drug_key"],
+            row["_category_key"],
+            row["_gene_key"],
+            row["_pheno_key"],
+        )
+        if row["_category_key"] and exact in witm_lookup:
+            return witm_lookup[exact]
 
+        return witm_lookup.get(
+            ("__drug__", row["_drug_key"], row["_gene_key"], row["_pheno_key"]),
+            "",
+        )
+
+    wide[about_std] = wide.apply(_pick_about, axis=1)
     wide[witm_std] = wide.apply(_pick_witm, axis=1)
-    wide = wide.drop(columns=["_drug_key", "_pheno_key", "_gene_key"], errors="ignore")
-    return wide
+
+    return wide.drop(
+        columns=["_drug_key", "_category_key", "_pheno_key", "_gene_key"],
+        errors="ignore",
+    )
 
 def _is_actionable(status: str) -> bool:
     return str(status).strip() not in NON_ACTIONABLE_STATUSES
@@ -823,9 +970,25 @@ def format_excel(writer, df, sheet_name):
     ws   = writer.sheets[sheet_name]
     wrap = wb.add_format({"text_wrap": True, "valign": "top"})
     head = wb.add_format({"bold": True, "bg_color": "#D9EAD3", "border": 1})
+
+    # Calculate display width safely. Some merged Excel cells can contain
+    # numeric values / NaN, and calling len() directly on those values raises
+    # TypeError. Converting each individual value with str() makes the formatter
+    # independent of the source dtype and does not change the dataframe itself.
+    def _cell_display_len(value):
+        if value is None:
+            return 0
+        try:
+            if pd.isna(value):
+                return 0
+        except (TypeError, ValueError):
+            # Non-scalar values (if any) are still safe to stringify below.
+            pass
+        return len(str(value))
+
     for idx, col in enumerate(df.columns):
-        series  = df[col].astype(str)
-        max_len = min(max(series.map(len).max(), len(str(col))) + 2, 70)
+        max_cell_len = max((_cell_display_len(v) for v in df[col].tolist()), default=0)
+        max_len = min(max(max_cell_len, len(str(col))) + 2, 70)
         ws.set_column(idx, idx, max_len, wrap)
         ws.write(0, idx, col, head)
 
@@ -1011,35 +1174,77 @@ def main():
         _df = pd.read_excel(SCRAPER_FILE, sheet_name=GSI_SHEET)
         _df.columns = [c.strip() for c in _df.columns]
         _df.rename(columns={"Drug": "Drug Name"}, inplace=True)
-        _about_lookup = build_about_lookup(_df)
-        _witm_lookup  = build_witm_lookup(_df)
 
-        _is_blank = lambda s: s.astype(str).str.strip().isin(["", "nan"])
+        _about_lookup = build_about_lookup(_df)
+        _witm_lookup = build_witm_lookup(_df)
+
+        _is_blank = lambda s: s.astype(str).str.strip().str.lower().isin(["", "nan", "none"])
+
+        # At this point Drug Category is still the ORIGINAL therapeutic category.
+        # It is copied into Therapeutic Category only later, immediately before
+        # final routing labels overwrite Drug Category.
+        _merged_category_col = _detect_category_col(merged)
 
         blank_about = _is_blank(merged[about_std])
         if blank_about.any():
-            merged.loc[blank_about, about_std] = (
-                merged.loc[blank_about, "Drug Name"]
-                .astype(str).str.strip().str.lower()
-                .map(_about_lookup)
-                .fillna("")
-            )
-            # print(f"[INFO] Fallback About fill: {blank_about.sum()} rows patched")
+            patched_about = []
+
+            for _, row in merged.loc[blank_about].iterrows():
+                drug_key = _norm_lookup_text(row.get("Drug Name", ""))
+                category_key = (
+                    _norm_lookup_text(row.get(_merged_category_col, ""))
+                    if _merged_category_col else ""
+                )
+
+                value = ""
+                if category_key:
+                    value = _about_lookup.get(
+                        ("__drug_category__", drug_key, category_key),
+                        "",
+                    )
+                if not value:
+                    value = _about_lookup.get(("__drug__", drug_key), "")
+
+                patched_about.append(value)
+
+            merged.loc[blank_about, about_std] = patched_about
 
         blank_witm = _is_blank(merged[witm_std])
         if blank_witm.any():
-            pheno_keys = merged.loc[blank_witm, "Phenotype"].astype(str).apply(_simplify_phenotype).tolist()
-            gene_keys  = merged.loc[blank_witm, "Gene"].astype(str).str.strip().tolist()
-            drug_keys  = merged.loc[blank_witm, "Drug Name"].astype(str).str.strip().str.lower().tolist()
-            patched = []
-            for d, g, p in zip(drug_keys, gene_keys, pheno_keys):
-                ds_val = _witm_lookup.get(("__drug__", d, g, p))
-                if ds_val:
-                    patched.append(ds_val)
-                else:
-                    patched.append(_witm_lookup.get((g, p), ""))
-            merged.loc[blank_witm, witm_std] = patched
-            # print(f"[INFO] Fallback WITM fill: {blank_witm.sum()} rows patched ({sum(1 for x in patched if x)} successful)")
+            patched_witm = []
+
+            for _, row in merged.loc[blank_witm].iterrows():
+                drug_key = _norm_lookup_text(row.get("Drug Name", ""))
+                category_key = (
+                    _norm_lookup_text(row.get(_merged_category_col, ""))
+                    if _merged_category_col else ""
+                )
+                gene_key = str(row.get("Gene", "") or "").strip().upper()
+                pheno_key = _simplify_phenotype(row.get("Phenotype", ""))
+
+                value = ""
+                if category_key:
+                    value = _witm_lookup.get(
+                        (
+                            "__drug_category__",
+                            drug_key,
+                            category_key,
+                            gene_key,
+                            pheno_key,
+                        ),
+                        "",
+                    )
+
+                if not value:
+                    value = _witm_lookup.get(
+                        ("__drug__", drug_key, gene_key, pheno_key),
+                        "",
+                    )
+
+                patched_witm.append(value)
+
+            merged.loc[blank_witm, witm_std] = patched_witm
+
     except Exception as e:
         pass
         # print(f"[WARN] Fallback consumer text pass failed: {e}")

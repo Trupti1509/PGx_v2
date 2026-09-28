@@ -6,92 +6,603 @@ HELPER/htmls_drug_wise.py
 
 import re
 import os
+import html as html_lib
+import pandas as pd
 
 root = os.getcwd()
 INTRO_ICONS_DIR = os.path.join(root, '02_deps', 'intro_icons')
 
+
+
+def _comma_safe_chunks(items, max_chars=220):
+    """
+    Split a dynamic medication list into short, pagination-safe comma groups.
+
+    This is intentionally provider/gene/drug agnostic.  It does NOT decide
+    physical pages.  It only prevents Paged.js from having to fragment one
+    very large inline text box across a page boundary.
+
+    Each returned chunk is small enough to be kept together with
+    ``break-inside: avoid`` while the overall list can still flow across any
+    number of physical pages.
+    """
+    chunks = []
+    current = []
+    current_chars = 0
+
+    for value in items or []:
+        text = str(value or '').strip()
+        if not text:
+            continue
+
+        extra = len(text) + (2 if current else 0)  # comma + space
+
+        if current and current_chars + extra > max_chars:
+            chunks.append(current)
+            current = [text]
+            current_chars = len(text)
+        else:
+            current.append(text)
+            current_chars += extra
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+# ============================================================================
+# FDA DDI REFERENCE
+# "Other Medications That May Compound This Result"
+# ============================================================================
+
+DDI_EXCEL_PATH = os.path.join(
+    root,
+    '02_deps',
+    'Xcode_DDI_Reference.xlsx'
+)
+
+_DDI_REFERENCE_CACHE = None
+
+
+def _load_ddi_reference():
+    """
+    Load the FDA-derived DDI workbook once.
+
+    Returns:
+        CYP dataframe
+        Transporter dataframe
+        gene -> (FDA target, reference sheet) mapping
+    """
+    global _DDI_REFERENCE_CACHE
+
+    if _DDI_REFERENCE_CACHE is not None:
+        return _DDI_REFERENCE_CACHE
+
+    empty = (
+        pd.DataFrame(),
+        pd.DataFrame(),
+        {}
+    )
+
+    if not os.path.exists(DDI_EXCEL_PATH):
+        print(
+            f"[WARN] DDI reference not found: "
+            f"{DDI_EXCEL_PATH}"
+        )
+        _DDI_REFERENCE_CACHE = empty
+        return _DDI_REFERENCE_CACHE
+
+    try:
+        cyp_df = pd.read_excel(
+            DDI_EXCEL_PATH,
+            sheet_name='CYP_Reference'
+        )
+
+        transporter_df = pd.read_excel(
+            DDI_EXCEL_PATH,
+            sheet_name='Transporter_Reference'
+        )
+
+        mapping_df = pd.read_excel(
+            DDI_EXCEL_PATH,
+            sheet_name='Gene_Mapping'
+        )
+
+        gene_map = {}
+
+        for row in mapping_df.to_dict('records'):
+
+            gene = str(
+                row.get(
+                    'Gene in Xcode Life Report',
+                    ''
+                )
+            ).strip().upper()
+
+            target_raw = str(
+                row.get(
+                    'Matches This Table As',
+                    ''
+                )
+            ).strip()
+
+            covered = str(
+                row.get(
+                    'Covered?',
+                    ''
+                )
+            ).strip().lower()
+
+            if (
+                not gene
+                or covered not in {'yes', 'partial'}
+            ):
+                continue
+
+            match = re.match(
+                r'^\s*(.*?)\s*'
+                r'\((CYP_Reference|Transporter_Reference)\)'
+                r'\s*$',
+                target_raw
+            )
+
+            if match:
+                gene_map[gene] = (
+                    match.group(1).strip(),
+                    match.group(2)
+                )
+
+        # These two aliases are relevant to the report but are not
+        # currently separate rows in your workbook's Gene_Mapping tab.
+        #
+        # FDA groups CYP3A4 / CYP3A5 as CYP3A.
+        # ABCG2 encodes the BCRP transporter.
+        gene_map.setdefault(
+            'CYP3A5',
+            ('CYP3A', 'CYP_Reference')
+        )
+
+        gene_map.setdefault(
+            'ABCG2',
+            ('BCRP', 'Transporter_Reference')
+        )
+
+        _DDI_REFERENCE_CACHE = (
+            cyp_df,
+            transporter_df,
+            gene_map
+        )
+
+    except Exception as exc:
+
+        print(
+            f"[WARN] Could not load DDI reference: "
+            f"{exc}"
+        )
+
+        _DDI_REFERENCE_CACHE = empty
+
+    return _DDI_REFERENCE_CACHE
+
+
+def _ddi_direction(phenotype: str):
+    """
+    Determine which kind of interaction would compound
+    the patient's genetic result.
+
+    Reduced activity -> inhibitors
+    Increased activity -> inducers
+    Normal / unknown -> no DDI alert
+    """
+
+    p = str(
+        phenotype or ''
+    ).strip().lower()
+
+    reduced_terms = (
+        'intermediate',
+        'poor',
+        'decreased',
+        'reduced',
+        'slow',
+        'low function',
+        'no function',
+    )
+
+    increased_terms = (
+        'ultrarapid',
+        'rapid',
+        'increased',
+        'gain of function',
+    )
+
+    if any(
+        term in p
+        for term in reduced_terms
+    ):
+        return 'reduced'
+
+    if any(
+        term in p
+        for term in increased_terms
+    ):
+        return 'increased'
+
+    return None
+
+
+def generate_compounding_alert_html(
+    drug_name: str,
+    gene_pheno_map: dict,
+    gene_status_map: dict,
+    fs_header: str = '14px',
+    fs_body: str = '11.5px',
+) -> str:
+    """
+    Create the:
+        Other Medications That May Compound This Result
+
+    box.
+
+    The box is shown only when:
+
+    1. The gene was actually analyzed.
+    2. The patient has a non-normal phenotype.
+    3. That gene/enzyme/transporter exists in the FDA DDI reference.
+    4. At least one relevant inhibitor/inducer exists.
+    """
+
+    (
+        cyp_df,
+        transporter_df,
+        gene_map
+    ) = _load_ddi_reference()
+
+    if not gene_map:
+        return ""
+
+    sections = []
+
+    # Highest-significance interactions first.
+    strength_rank = {
+        'strong': 0,
+        'moderate': 1,
+        'weak': 2,
+    }
+
+    for gene in sorted(gene_pheno_map):
+
+        # Only use a real patient genetic result.
+        if (
+            str(
+                gene_status_map.get(
+                    gene,
+                    ''
+                )
+            ).strip().lower()
+            != 'analyzed'
+        ):
+            continue
+
+        gene_key = (
+            str(gene)
+            .strip()
+            .upper()
+        )
+
+        mapping = gene_map.get(
+            gene_key
+        )
+
+        if not mapping:
+            continue
+
+        target, table_name = mapping
+
+        # A gene can occasionally have multiple possible
+        # phenotypes because of phasing uncertainty.
+        directions = {
+            'reduced': [],
+            'increased': [],
+        }
+
+        for (
+            _,
+            phenotype_text
+        ) in gene_pheno_map.get(
+            gene,
+            []
+        ):
+
+            # Your existing code joins multiple phenotypes using " / "
+            for phenotype in str(
+                phenotype_text
+            ).split(' / '):
+
+                phenotype = (
+                    phenotype.strip()
+                )
+
+                direction = (
+                    _ddi_direction(
+                        phenotype
+                    )
+                )
+
+                if (
+                    direction
+                    and phenotype
+                    not in directions[
+                        direction
+                    ]
+                ):
+                    directions[
+                        direction
+                    ].append(
+                        phenotype
+                    )
+
+        for (
+            direction,
+            phenotypes
+        ) in directions.items():
+
+            if not phenotypes:
+                continue
+
+            # IMPORTANT:
+            #
+            # Reduced / slow metabolism:
+            #     inhibitors can compound the result.
+            #
+            # Rapid / increased metabolism:
+            #     inducers can compound the result.
+            role = (
+                'Inhibitor'
+                if direction == 'reduced'
+                else 'Inducer'
+            )
+
+            if (
+                table_name
+                == 'CYP_Reference'
+            ):
+
+                source_df = cyp_df
+                target_col = 'Enzyme'
+
+            else:
+
+                source_df = (
+                    transporter_df
+                )
+                target_col = (
+                    'Transporter'
+                )
+
+            if source_df.empty:
+                continue
+
+            matches = source_df[
+                source_df[
+                    target_col
+                ]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .eq(
+                    target.upper()
+                )
+                &
+                source_df[
+                    'Role'
+                ]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .eq(
+                    role.lower()
+                )
+            ].copy()
+
+            if matches.empty:
+                continue
+
+            # Strong -> Moderate -> Weak
+            matches[
+                '_strength_rank'
+            ] = (
+                matches[
+                    'Strength'
+                ]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .map(
+                    lambda x:
+                    strength_rank.get(
+                        x,
+                        99
+                    )
+                )
+            )
+
+            matches = (
+                matches.sort_values(
+                    '_strength_rank',
+                    kind='stable'
+                )
+            )
+
+            medications = []
+
+            current_drug = (
+                str(drug_name)
+                .strip()
+                .casefold()
+            )
+
+            for raw_med in (
+                matches['Drug']
+                .tolist()
+            ):
+
+                med = str(
+                    raw_med
+                ).strip()
+
+                if (
+                    not med
+                    or med.casefold()
+                    == current_drug
+                ):
+                    continue
+
+                display_med = med.title()
+
+                if (
+                    display_med
+                    not in medications
+                ):
+                    medications.append(
+                        display_med
+                    )
+
+                # Match the mock:
+                # maximum 4 medications
+                if len(
+                    medications
+                ) == 4:
+                    break
+
+            if not medications:
+                continue
+
+            phenotype_display = (
+                ' / '.join(
+                    phenotypes
+                )
+            )
+
+            pills_html = ''.join(
+
+                f'<span style="'
+                f'background:#dbeafe; '
+                f'color:#075985; '
+                f'border:1px solid #93c5fd; '
+                f'border-radius:12px; '
+                f'padding:2px 8px; '
+                f'font-size:11px; '
+                f'font-weight:600; '
+                f'display:inline-block; '
+                f'margin:2px 4px 2px 0;'
+                f'">{med}</span>'
+
+                for med
+                in medications
+            )
+
+            # Use the FDA table target name for display.
+            # This matters because some report genes map to a different
+            # FDA interaction-system label:
+            #
+            # CYP3A5  -> CYP3A
+            # SLCO1B1 -> OATP1B1
+            # ABCG2   -> BCRP
+            system_label = target
+
+            interaction_text = (
+                f'Your <strong>{gene_key}</strong> result shows '
+                f'<strong>{phenotype_display}</strong> status and may influence '
+                f'how your body handles <strong>{str(drug_name).title()}</strong>. '
+                f'The following are examples of FDA-listed medications or substances '
+                f'that affect <strong>{system_label}</strong> and may further modify '
+                f'drug exposure or response if taken together:'
+            ) 
+
+            sections.append(
+                f'<div style="'
+                f'font-size:{fs_body}; '
+                f'color:#1e293b; '
+                f'line-height:1.5; '
+                f'margin-bottom:4px;'
+                f'">'
+                f'{interaction_text}'
+                f'</div>'
+
+                f'<div style="'
+                f'line-height:1.5; '
+                f'margin-bottom:5px;'
+                f'">'
+                f'{pills_html}'
+                f'</div>'
+            )
+
+    if not sections:
+        return ""
+
+    # If more than one altered gene applies to the drug,
+    # keep everything inside one DDI box instead of creating
+    # several separate boxes.
+    separator = (
+        '<div style="'
+        'height:1px; '
+        'background:#bfdbfe; '
+        'margin:6px 0;'
+        '"></div>'
+    )
+
+    return (
+
+        f'<div style="'
+        f'background:#eff6ff; '
+        f'border:1px solid #bfdbfe; '
+        f'border-left:4px solid #0284c7; '
+        f'border-radius:6px; '
+        f'padding:7px 11px; '
+        f'margin:0 0 10px 0; '
+        f'page-break-inside:avoid; '
+        f'break-inside:avoid;'
+        f'">'
+
+        f'<div style="'
+        f'font-size:{fs_header}; '
+        f'font-weight:700; '
+        f'color:#075985; '
+        f'margin-bottom:4px;'
+        f'">'
+
+        f'Other Medications That May '
+        f'Further Influence This Result '
+
+        f'</div>'
+
+        f'{separator.join(sections)}'
+
+        f'<div style="'
+        f'font-size:10px; '
+        f'color:#64748b; '
+        f'font-style:italic; '
+        f'line-height:1.4;'
+        f'">'
+
+        f'If you are currently taking '
+        f'any of the above, mention this '
+        f'to your prescriber. '
+
+        f'This is general reference '
+        f'information based on your '
+        f'genetic result — it is not '
+        f'a personalized check of your '
+        f'current medications.'
+
+        f'</div>'
+
+        f'</div>'
+    )
+
 def sanitize_id(name):
     return re.sub(r'[^a-z0-9_-]', '_', str(name).lower().strip())
-
-def _partition_items(items, heights, budget_p1, budget_p2, last_page_note_height=0):
-    """
-    Partitions items into pages greedily such that:
-    1. The number of pages P is minimized.
-    2. Items on each page fit within the page budget.
-    3. Early pages are packed as much as possible up to their budgets,
-       preventing tables/cards from splitting in half arbitrarily.
-    """
-    n = len(items)
-    if n == 0:
-        return []
-        
-    # Helper to simulate if the remaining heights can fit into pages_left pages.
-    def can_pack(rem_heights, pages_left, budget, last_page_note_h):
-        if len(rem_heights) == 0:
-            return True
-        if pages_left <= 0:
-            return False
-        c_height = 0
-        c_page = 1
-        rem_n = len(rem_heights)
-        for idx, h in enumerate(rem_heights):
-            note_h = last_page_note_h if idx == rem_n - 1 else 0
-            if c_height + h + note_h > budget:
-                c_page += 1
-                c_height = h
-                if c_page > pages_left:
-                    return False
-            else:
-                c_height += h
-        return c_page <= pages_left
-
-    # Step 1: Calculate the minimum number of pages P required
-    pages_count = 1
-    curr_height = 0
-    for idx, h in enumerate(heights):
-        budget = budget_p1 if pages_count == 1 else budget_p2
-        note_h = last_page_note_height if idx == n - 1 else 0
-        if curr_height + h + note_h > budget:
-            pages_count += 1
-            curr_height = h
-        else:
-            curr_height += h
-            
-    P = pages_count
-    if P == 1:
-        return [items]
-        
-    # Step 2: Greedily pack items into pages 1 to P
-    pages = []
-    start_idx = 0
-    for chunk_idx in range(P):
-        # Determine budget for this page
-        budget = budget_p1 if chunk_idx == 0 else budget_p2
-        
-        # If this is the last page, it takes all remaining items
-        if chunk_idx == P - 1:
-            pages.append(items[start_idx:])
-            break
-            
-        pages_left = P - 1 - chunk_idx
-        # Find the maximum number of items we can put on this page
-        # such that the remainder can still be packed in the remaining pages.
-        best_count = 0
-        curr_sum = 0
-        for count in range(1, n - start_idx - pages_left + 1):
-            curr_sum += heights[start_idx + count - 1]
-            if curr_sum > budget:
-                break
-            if can_pack(heights[start_idx + count:], pages_left, budget_p2, last_page_note_height):
-                best_count = count
-                
-        if best_count == 0:
-            best_count = 1  # Fallback
-            
-        pages.append(items[start_idx : start_idx + best_count])
-        start_idx += best_count
-        
-    return pages
 
 def icon_badge(bg_from, bg_to):
     return f"""
@@ -162,10 +673,15 @@ def pretty_genotype_pair(gene: str, raw_diplotype: str):
 # STYLES
 # ============================================================================
 
-def styles(fonts):
+def styles(fonts, patient_name="Patient"):
     regular = fonts.get('regular', '')
     bold    = fonts.get('bold', '')
     italic  = fonts.get('italic', '')
+
+    # Paged.js renders the physical footer through @page margin boxes.
+    # Escape only the characters that can break a CSS quoted string.
+    footer_label = f"Pharmacogenomics Report - {patient_name}"
+    footer_label = footer_label.replace('\\', '\\\\').replace('\"', '\\"')
 
     return f"""
     @font-face {{
@@ -197,46 +713,166 @@ def styles(fonts):
 html, body {{
         font-family: 'DM Sans', Arial, sans-serif;
         font-size: 11.5px;
-        background: white;
+        background: transparent;
         color: #1a1a1a;
         width: 100%;
         margin: 0;
         padding: 0;
     }}
 
+
+    /* ================================================================
+       PAGED.JS PHYSICAL PAGE MODEL
+       ================================================================
+       HTML wrappers represent report TOPICS, not fixed-height paper pages.
+       Paged.js decides the real physical page breaks after layout.
+    */
+    @page {{
+        size: A4;
+        margin: 30px 52px 64px 52px;
+
+        @bottom-left {{
+            content: "{footer_label}";
+            font-family: 'DM Sans', Arial, sans-serif;
+            font-size: 9px;
+            color: #444444;
+            border-top: 1.5px solid #00B5C8;
+            padding-top: 4px;
+            vertical-align: top;
+            text-align: left;
+        }}
+
+        @bottom-center {{
+            content: counter(page);
+            font-family: 'DM Sans', Arial, sans-serif;
+            font-size: 9px;
+            font-weight: 700;
+            color: #444444;
+            border-top: 1.5px solid #00B5C8;
+            padding-top: 4px;
+            vertical-align: top;
+            text-align: center;
+        }}
+
+        @bottom-right {{
+            content: "Table of Contents";
+            font-family: 'DM Sans', Arial, sans-serif;
+            font-size: 9px;
+            font-style: italic;
+            color: #00B5C8;
+            border-top: 1.5px solid #00B5C8;
+            padding-top: 4px;
+            vertical-align: top;
+            text-align: right;
+        }}
+    }}
+
+    /* Page numbers are resolved AFTER layout from each link target. */
+    .toc-page-number::after {{
+        content: target-counter(attr(href), page);
+    }}
+
+    .toc-page-number {{
+        color: #374151;
+        font-weight: 700;
+        text-decoration: none;
+    }}
+
+    p, li {{
+        orphans: 3;
+        widows: 3;
+    }}
+
     /* ── A4 Page Setup ──
        NO fixed height — let Chromium paginate naturally so content that is
        too long for one page flows to the next instead of being clipped.
-       The visible footer (cyan rule + patient label + page number + TOC text)
-       is rendered by Chromium's footerTemplate and always appears at the
-       physical bottom of every printed page regardless of content length.
-       A tiny transparent <a href="#tocpage"> with position:fixed (in _wrap_page)
-       provides TOC clickability without causing PDF bloat.
+       The visible footer (cyan rule + report title + page number + TOC text)
+       is rendered by Paged.js @page margin boxes. The bottom page margin is
+       reserved by the paged-media layout itself, so topic wrappers do not need
+       artificial footer padding.
+    */
+    /*
+       IMPORTANT PAGED.JS RULE:
+       A .page is a LOGICAL REPORT SECTION, not a fixed-height sheet.
+       It may fragment across 2, 3, or more physical PDF pages.
 
-       padding-bottom: 30px gives a content buffer above the Chromium bottom
-       margin (48px) so the last line of content never touches the footer rule.
+       Force the START of every top-level report section onto a fresh page.
+       We deliberately use break-before instead of break-after: when a section
+       itself fragments across multiple pages, Paged.js can ignore/resolve an
+       end break differently than expected. break-before on the NEXT section is
+       deterministic and prevents the next drug/topic from being pulled into
+       unused space on the previous section's last page.
     */
     .page {{
         width: 100%;
-        min-height: 200px;
+        min-height: 0;
         box-sizing: border-box;
         background: white;
         position: relative;
-        page-break-after: always;
-        padding-bottom: 30px;
+        padding-bottom: 0;
+
+        page-break-inside: auto !important;
+        break-inside: auto !important;
+
+        page-break-after: auto !important;
+        break-after: auto !important;
     }}
 
-    .page:last-child {{ page-break-after: auto; }}
+    /* First logical section (TOC) starts normally. Every later topic starts fresh. */
+    body > .page:not(:first-child) {{
+        page-break-before: always !important;
+        break-before: page !important;
+    }}
 
-   /* ── Pagination Rules (Prevents Awkward Splits) ── */
+    .intro-page {{
+        background: transparent !important;
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+        padding-bottom: 0 !important;
+    }}
+
+    /* Keep an intro title attached to the first content block below it. */
+    .intro-page .page-title {{
+        page-break-after: avoid !important;
+        break-after: avoid !important;
+    }}
+
+   /* ── Pagination Rules (Let Chromium flow content naturally) ── */
     .welcome-box, .faq-card-wrap, .drug-header {{
         page-break-inside: avoid;
         break-inside: avoid;
     }}
-    
+
+    .drug-header {{
+        page-break-after: avoid !important;
+        break-after: avoid !important;
+    }}
+
+    /*
+       Keep each phenotype-specific recommendation entry together when it fits.
+       Paged.js can otherwise fragment a nested bordered recommendation card at
+       the page boundary and fail to paint the first fragment, which makes the
+       beginning of the recommendation appear missing in the PDF.
+       The outer CPIC/DPWG/FDA source block remains splittable.
+    */
+    .recommendation-entry {{
+        page-break-inside: avoid !important;
+        break-inside: avoid !important;
+    }}
+
+    .recommendation-source-label {{
+        page-break-after: avoid !important;
+        break-after: avoid !important;
+    }}
+
+    /* Keep the large content blocks fluid; do not force every row or heading onto
+       a fresh paper page. Chromium should decide the physical break according to
+       the actual rendered height. */
+    /* Keep table rows intact across physical pages.  Tables themselves may
+       flow for as many pages as needed, and thead is repeated by Paged.js. */
     tr {{
-        page-break-inside: avoid;
-        break-inside: avoid;
+        page-break-inside: avoid !important;
+        break-inside: avoid !important;
     }}
 
     td, th {{
@@ -254,8 +890,8 @@ html, body {{
     
     thead {{
         display: table-header-group;
-        page-break-inside: avoid;
-        break-inside: avoid;
+        page-break-inside: auto !important;
+        break-inside: auto !important;
     }}
     
     td, th {{
@@ -270,9 +906,65 @@ html, body {{
     }}
     /* .info-box intentionally excluded — allow large content boxes to split across pages */
 
+    /* Pagination-safe grid rows for static introductory tables.
+       Paged.js can occasionally consume part of a native <tr> at a page
+       boundary without painting it.  These block/grid rows are atomic, so a
+       whole row moves to the next physical page instead of losing text. */
+    .intro-safe-grid {{
+        width: 100%;
+        box-sizing: border-box;
+    }}
+
+    .intro-safe-grid-header,
+    .intro-safe-row {{
+        page-break-inside: avoid !important;
+        break-inside: avoid !important;
+        box-sizing: border-box;
+    }}
+
+    .intro-safe-grid-header {{
+        page-break-after: avoid !important;
+        break-after: avoid !important;
+    }}
+
+    .crosslisted-category-block {{
+        page-break-inside: auto !important;
+        break-inside: auto !important;
+        margin-top: 10px;
+    }}
+
+    /* Keep the category heading attached to the repeated drug title. */
+    .crosslisted-category-block .crosslisted-category-heading,
+    .crosslisted-category-block .drug-header {{
+        page-break-after: avoid !important;
+        break-after: avoid !important;
+    }}
+
+    /* Keep each SMALL secondary-category box intact when it fits, but allow
+       page breaks between boxes.  Do not make the whole cross-listed block
+       atomic, because long category-specific About/WITM text may need to flow. */
+    .crosslisted-about-box,
+    .crosslisted-impact-box,
+    .crosslisted-reference-box {{
+        page-break-inside: avoid !important;
+        break-inside: avoid !important;
+    }}
+
+    .intro-section {{
+        page-break-inside: auto !important;
+        break-inside: auto !important;
+    }}
+
+    .intro-heading {{
+        page-break-after: avoid !important;
+        break-after: avoid !important;
+        break-inside: avoid !important;
+    }}
+
     h1, h2, h3, .page-title, .section-block-header {{
-        page-break-after: avoid;
-        break-after: avoid;
+        page-break-after: avoid !important;
+        break-after: avoid !important;
+        break-inside: avoid !important;
     }}
 
     /* ── Page Title ── */
@@ -491,6 +1183,17 @@ html, body {{
         padding-left: 8px;
         border-left: 3px solid #0D3B7A;
     }}
+    /* Dynamic page reference used by compact cross-listed drug entries.
+       Paged.js resolves the physical page of the primary/full monograph. */
+    a.cross-ref-page {{
+        color: #0D3B7A;
+        font-weight: 700;
+        text-decoration: none;
+    }}
+    a.cross-ref-page::after {{
+        content: target-counter(attr(href), page);
+    }}
+
     .toc-row {{
         display: flex;
         justify-content: space-between;
@@ -513,29 +1216,400 @@ html, body {{
         border-color: transparent !important;
     }}
 
-"""
+
+/* ================================================================
+   UNIVERSAL REPORT PAGINATION
+   ================================================================ */
+
+/*
+   Large sections are allowed to continue naturally onto another page.
+   Chromium decides the break based on the ACTUAL rendered height.
+*/
+.flow-section {{
+    page-break-inside: auto !important;
+    break-inside: auto !important;
+}}
 
 
+/*
+   Small logical units that should remain together.
+*/
+.keep-together {{
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+}}
 
-# ============================================================================
-# _wrap_page — page wrapper
-# ============================================================================
 
-def _wrap_page(content, patient_name, page_num, page_id=""):
+/*
+   Prevent a heading from being left alone at the bottom of a page.
+*/
+.keep-with-next {{
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+}}
+
+
+/*
+   Large cards can continue naturally onto another physical PDF page.
+   Keep the box itself simple so Paged.js only has to fragment normal flow.
+*/
+.flow-card {{
+    page-break-inside: auto !important;
+    break-inside: auto !important;
+    overflow: visible !important;
+    max-height: none !important;
+    height: auto !important;
+}}
+
+
+/*
+   Keep the beginning of a card together:
+   header + short introductory information.
+*/
+.flow-card-top {{
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+}}
+
+
+/*
+   Dynamic pagination safety for variable-length medication content.
+   Nothing here depends on provider, gene, category, drug count, or page count.
+*/
+.oem-card {{
+    /* Keep ordinary cards together. If a future card is taller than a page,
+       its block-level medication rows below provide safe fallback break points. */
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    overflow: visible !important;
+    max-height: none !important;
+    height: auto !important;
+}}
+
+.oem-card-head {{
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+}}
+
+.oem-medication-list {{
+    display: block;
+    padding: 0;
+    page-break-inside: auto !important;
+    break-inside: auto !important;
+    overflow: visible !important;
+    orphans: 2;
+    widows: 2;
+}}
+
+.oem-medication-chunk {{
+    display: block;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    overflow: visible !important;
+    margin: 0;
+    padding: 0;
+}}
+
+/* Compact comma-separated OEM display.
+   Each medication remains individually marked for PDF QA, but visually the
+   list reads exactly like normal prose instead of a bullet list. */
+.oem-medication-item {{
+    display: inline;
+    white-space: nowrap;
+}}
+
+.oem-card-count {{
+    page-break-before: avoid !important;
+    break-before: avoid !important;
+}}
+
+.specialized-gene-card {{
+    page-break-inside: auto !important;
+    break-inside: auto !important;
+    overflow: visible !important;
+    max-height: none !important;
+    height: auto !important;
+}}
+
+.specialized-gene-top {{
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+}}
+
+.specialized-affected-section {{
+    page-break-inside: auto !important;
+    break-inside: auto !important;
+}}
+
+.specialized-med-group {{
+    page-break-inside: auto !important;
+    break-inside: auto !important;
+    margin: 0 0 7px 0;
+}}
+
+.specialized-med-category {{
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+    font-weight: 700;
+    color: #0D3B7A;
+    font-size: 11.5px;
+    line-height: 1.35;
+    margin-bottom: 2px;
+}}
+
+/* Compact comma-separated Specialized Testing display.
+   IMPORTANT: the complete medication list is NOT one large fragmenting box.
+   Python breaks the dynamic list into short invisible-layout chunks.  Each
+   chunk is kept together, while the overall list may span unlimited pages.
+   Visually this remains ordinary comma-separated text — no bullets. */
+.specialized-med-list {{
+    display: block;
+    padding: 0;
+    page-break-inside: auto !important;
+    break-inside: auto !important;
+    overflow: visible !important;
+    color: #374151;
+    font-size: 11.5px;
+    line-height: 1.4;
+}}
+
+.specialized-med-first-fragment,
+.specialized-med-chunk {{
+    display: block;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    overflow: visible !important;
+    margin: 0;
+    padding: 0;
+}}
+
+.specialized-med-item {{
+    display: inline;
+    white-space: normal;
+}}
+
+/* ================================================================
+   PAGINATION-SAFE VARIABLE DATA GRIDS
+   ================================================================
+   These are intentionally NOT native <table>/<tr> structures.  Chromium /
+   Paged.js can occasionally consume the first fragment of a long table row at
+   a physical page boundary.  Each data row below is its own normal block, so a
+   row that fits on one page moves intact to the next page.  The outer section
+   remains fully fluid and can span any number of physical pages.
+*/
+.genotype-grid-header,
+.genotype-grid-row {{
+    display: grid;
+    grid-template-columns: 20% 30% 50%;
+    width: 100%;
+    box-sizing: border-box;
+}}
+
+.genotype-grid-header {{
+    background: #174A86;
+    color: #ffffff;
+    border-radius: 7px 7px 0 0;
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+}}
+
+.genotype-grid-row {{
+    border-bottom: 1px solid #f3f4f6;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+}}
+
+.genotype-grid-cell {{
+    padding: 6px 9px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    word-break: normal;
+    box-sizing: border-box;
+}}
+
+.analytical-grid-header,
+.analytical-grid-row {{
+    display: grid;
+    grid-template-columns: 18% 82%;
+    width: 100%;
+    box-sizing: border-box;
+}}
+
+.analytical-grid-header {{
+    background: #174A86;
+    color: #ffffff;
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+}}
+
+.analytical-grid-row {{
+    border-bottom: 1px solid #fde68a;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+}}
+
+.analytical-grid-cell {{
+    padding: 5px 8px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    word-break: normal;
+    box-sizing: border-box;
+}}
+
+.no-guideline-grid {{
+    width: 100%;
+    box-sizing: border-box;
+}}
+
+/*
+   IMPORTANT: do not use CSS Grid for this multi-page list.
+   Paged.js 0.4.3 can lose the leading fragment of a grid/table-like row
+   when the parent is fragmented at a physical page boundary.
+
+   Each row below is therefore a simple atomic block.  The two cells are
+   inline-block children purely for the visual two-column layout.  Paged.js
+   may break BETWEEN rows, but never needs to fragment a row itself.
+*/
+.no-guideline-grid-header,
+.no-guideline-grid-row {{
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    font-size: 0;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    -webkit-column-break-inside: avoid;
+    overflow: hidden;
+}}
+
+.no-guideline-grid-header {{
+    background: #023D79;
+    color: #ffffff;
+    border: 1px solid #023D79;
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+}}
+
+.no-guideline-grid-row {{
+    display: flex;
+    flex-wrap: nowrap;
+    border-left: 1px solid #dde2ea;
+    border-right: 1px solid #dde2ea;
+    border-bottom: 1px solid #e5e7eb;
+    min-height: 34px;
+}}
+
+.no-guideline-grid-cell {{
+    display: block;
+    flex: 0 0 auto;
+    vertical-align: top;
+    padding: 5px 8px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    word-break: normal;
+    box-sizing: border-box;
+    font-size: 12px;
+}}
+
+.no-guideline-grid-cell:first-child {{
+    width: 40%;
+    flex-basis: 40%;
+}}
+
+.no-guideline-grid-cell:last-child {{
+    width: 60%;
+    flex-basis: 60%;
+}}
+
+/*
+   Generic multi-page table.
+*/
+.flow-table {{
+    width: 100%;
+    border-collapse: collapse;
+
+    page-break-inside: auto !important;
+    break-inside: auto !important;
+}}
+
+.flow-table thead {{
+    display: table-header-group;
+}}
+
+.flow-table tbody {{
+    page-break-inside: auto !important;
+    break-inside: auto !important;
+}}
+
+.flow-table tr {{
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+}}
+
+/* Universal heading behavior: never strand a heading at page bottom. */
+.page-title,
+.section-block-header,
+.keep-with-next {{
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+}}
+
+/* Genotype Summary + Analytical Notes are ONE continuous topic. */
+.genotype-summary-section {{
+    page-break-inside: auto !important;
+    break-inside: auto !important;
+}}
+
+.analytical-notes-box {{
+    page-break-inside: auto !important;
+    break-inside: auto !important;
+    -webkit-box-decoration-break: clone;
+    box-decoration-break: clone;
+}}
+
+.analytical-notes-heading {{
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+}}
     """
-    Wrap a page's content in a .page div.  Footer appearance:
-        [Patient's PGx Report]  |  [page number]  |  Table of Contents (clickable)
 
-    The visible cyan-rule footer is rendered by Chromium's footerTemplate (utils.py).
-    The clickable "Table of Contents" link lives in the DOM as position:fixed
-    so it appears at the physical page bottom on every printed page.
-    footerTemplate anchors are stripped by Chromium, so the link must be here.
+def _wrap_page(
+    content,
+    patient_name,
+    page_num,
+    page_id="",
+    background_color=None
+):
     """
-    _ = page_num   # sequential numbers are now handled by Chromium footerTemplate
-    pid = f' id="{page_id}"' if page_id else ''
+    Wrap report content in a page.
+
+    background_color is now used only as a flag identifying
+    introductory pages. The actual full-page tint is applied
+    after PDF generation in utils.py.
+    """
+
+    _ = page_num
+
+    pid = (
+        f' id="{page_id}"'
+        if page_id
+        else ''
+    )
+
+    # Existing intro templates already pass background_color.
+    # We use that only to assign the intro-page class.
+    page_class = (
+        ' intro-page'
+        if background_color
+        else ''
+    )
 
     return f"""
-    <div class="page"{pid}>
+    <div class="page{page_class}"{pid}>
         {content}
     </div>
     """
@@ -598,219 +1672,936 @@ def _wrap_page_OLD_DEPRECATED(content, patient_name, page_num, page_id=""):
 # ============================================================================
 
 def welcome_template(name, pg):
+
     def _h2(text):
-        return (f'<div style="font-size:12px; font-weight:700; color:#023D79; '
-                f'margin-top:10px; margin-bottom:4px; padding-bottom:3px; '
-                f'border-bottom:1.5px solid #e5e7eb;">{text}</div>')
-
-    def _para(text):
-        return f'<p style="font-size:11.5px; color:#374151; line-height:1.6; margin-bottom:6px;">{text}</p>'
-
-    pgx_rows = [
-        ("Clopidogrel (antiplatelet)",
-         "Alternative antiplatelet therapy may be recommended for CYP2C19 intermediate or poor metabolizers, especially in ACS/PCI settings."),
-        ("Warfarin (blood thinner)",
-         "PGx-guided dosing can help estimate the warfarin starting dose when CYP2C9, VKORC1, CYP4F2, and clinical factors are available."),
-        ("SSRIs (antidepressants)",
-         "CYP2C19 and CYP2D6 variants affect how drugs like escitalopram and sertraline are metabolized. Rapid or ultrarapid metabolism may reduce exposure to some antidepressants, which can affect response."),
-        ("Statins (cholesterol drugs)",
-         "Variants in SLCO1B1, ABCG2, and CYP2C9 can affect statin exposure and the risk of statin-associated muscle symptoms; the level of concern differs by statin and dose."),
-        ("Thiopurines (chemotherapy / immunosuppression)",
-         "TPMT and NUDT15 variants affect tolerance to active thiopurine metabolites and can increase the risk of severe myelosuppression."),
-    ]
-    table_body = ""
-    for i, (drug, guidance) in enumerate(pgx_rows):
-        bg = "#f9fafb" if i % 2 == 0 else "#ffffff"
-        table_body += (
-            f'<tr style="background:{bg};">'
-            f'<td style="padding:6px 10px; font-size:12px; font-weight:600; border:1px solid #e5e7eb; '
-            f'color:#1a1a1a; width:30%; vertical-align:top;">{drug}</td>'
-            f'<td style="padding:6px 10px; font-size:12px; border:1px solid #e5e7eb; '
-            f'color:#374151; line-height:1.5;">{guidance}</td>'
-            f'</tr>'
+        return (
+            f'<div style="'
+            f'font-size:12px; '
+            f'font-weight:700; '
+            f'color:#023D79; '
+            f'margin-top:10px; '
+            f'margin-bottom:4px; '
+            f'padding-bottom:3px; '
+            f'border-bottom:1.5px solid #e5e7eb;'
+            f'">'
+            f'{text}'
+            f'</div>'
         )
 
-    page_content = f"""
-    <div style="padding-top: 10px;">
-        <div class="page-title" id="welcome">About Personalized Medicine</div>
 
-        {_h2("What Is Personalized Medicine and Why Does It Matter?")}
-        {_para("Medicine has traditionally been prescribed based on population averages: a standard drug at a standard dose for everyone with the same diagnosis. But we are not all the same. Your genes, lifestyle, age, and other biological factors shape how your body responds to a medication. Personalized medicine, sometimes called precision medicine, is an approach that uses these individual differences to guide treatment choices.")}
-        {_para("One of the most important drivers of this variability is pharmacogenomics (PGx): the study of how your genetic makeup influences how your body processes and responds to drugs. Even small differences in specific genes can change how quickly you break down a drug, how much of it reaches your bloodstream, and how strongly you respond to it.")}
-        {_para("Knowing this in advance helps your doctor make smarter choices &mdash; potentially avoiding drugs that won't work well for you, choosing safer alternatives, or adjusting doses before problems arise.")}
+    def _para(text):
+        return (
+            f'<p style="'
+            f'font-size:11.5px; '
+            f'color:#374151; '
+            f'line-height:1.6; '
+            f'margin-bottom:6px;'
+            f'">'
+            f'{text}'
+            f'</p>'
+        )
 
-        {_h2("Where the Science Stands")}
-        {_para("Pharmacogenomics is not new; it has been studied for decades, but clinical adoption has accelerated dramatically. Today, major health institutions around the world use PGx testing to guide prescribing in oncology, psychiatry, cardiology, infectious disease, and more.")}
-        {_para("Authoritative bodies like CPIC (Clinical Pharmacogenetics Implementation Consortium), ClinPGx (formerly PharmGKB), and the FDA have published evidence-based guidelines that translate genetic findings directly into prescribing recommendations.")}
-        {_para("At the same time, the field is still growing. Not every drug has robust PGx evidence yet, and not every genetic variant has been fully characterized. This is why this report is structured carefully: only gene-drug combinations with established clinical guidelines are presented as actionable recommendations. Everything else is shown transparently, with clear explanations of what is and isn't yet known.")}
 
-        {_h2("The Different Types of Pharmacogenes")}
-        {_para("Not all pharmacogenomic genes work the same way. This report includes several types of genes, each of which influences drug response through a different mechanism. Understanding this helps you interpret the phenotype labels you will encounter:")}
-        <ul style="font-size:11.5px; color:#374151; line-height:1.6; margin-top:4px; margin-bottom:8px; padding-left:18px;">
-            <li><strong>1. Drug-Metabolizing Enzymes (CYP genes, DPYD, TPMT, NUDT15, UGT1A1)</strong>: These genes encode enzymes that chemically break down drugs in the liver or gut. Variants affect how quickly a drug is cleared from the body. These are described using the metabolizer phenotype framework (Normal, Intermediate, Poor, Rapid/Ultrarapid Metabolizer).</li>
-            <li><strong>2. Drug Transporter Genes (SLCO1B1, ABCG2)</strong>: These genes encode proteins that physically move drugs across cell membranes. Variants are described as Decreased Function or Poor Function, because the drug is not being metabolized differently &mdash; it is being transported differently.</li>
-            <li><strong>3. Drug Target / Mechanism Genes (VKORC1, RYR1, CACNA1S)</strong>: These encode the actual molecular targets of a drug. Variants are described differently from metabolizer phenotypes (e.g., specific variant names like -1639 G/A, or Malignant Hyperthermia Susceptibility).</li>
-            <li><strong>4. Immune and Hypersensitivity Genes (HLA-A, HLA-B)</strong>: These genes are involved in immune recognition. Certain alleles are associated with severe immune reactions to specific drugs and require specialized high-resolution typing.</li>
-            <li><strong>5. Response Prediction Genes (IFNL3)</strong>: Some genes predict how likely a patient is to respond to a treatment rather than predicting toxicity. For example, IFNL3 variants predict the likelihood of sustained virologic response to interferon-based hepatitis C therapies.</li>
+    # ========================================================================
+    # TABLE USED ON PAGE 2
+    # ========================================================================
+
+    pgx_rows = [
+
+        (
+            "Clopidogrel (antiplatelet)",
+
+            "Alternative antiplatelet therapy may be recommended "
+            "for CYP2C19 intermediate or poor metabolizers, "
+            "especially in ACS/PCI settings."
+        ),
+
+        (
+            "Warfarin (blood thinner)",
+
+            "PGx-guided dosing can help estimate the warfarin "
+            "starting dose when CYP2C9, VKORC1, CYP4F2, and "
+            "clinical factors are available."
+        ),
+
+        (
+            "SSRIs (antidepressants)",
+
+            "CYP2C19 and CYP2D6 variants affect how drugs like "
+            "escitalopram and sertraline are metabolized. Rapid "
+            "or ultrarapid metabolism may reduce exposure to some "
+            "antidepressants, which can affect response."
+        ),
+
+        (
+            "Statins (cholesterol drugs)",
+
+            "Variants in SLCO1B1, ABCG2, and CYP2C9 can affect "
+            "statin exposure and the risk of statin-associated "
+            "muscle symptoms; the level of concern differs by "
+            "statin and dose."
+        ),
+
+        (
+            "Thiopurines (chemotherapy / immunosuppression)",
+
+            "TPMT and NUDT15 variants affect tolerance to active "
+            "thiopurine metabolites and can increase the risk of "
+            "severe myelosuppression."
+        ),
+    ]
+
+
+    table_body = ""
+
+
+    for i, (drug, guidance) in enumerate(
+        pgx_rows
+    ):
+
+        bg = (
+            "#f9fafb"
+            if i % 2 == 0
+            else "#ffffff"
+        )
+
+
+        table_body += (
+            f'<div class="intro-safe-row" style="display:grid; grid-template-columns:30% 70%; background:{bg};">'
+            f'<div style="padding:6px 10px; font-size:12px; font-weight:600; border-left:1px solid #e5e7eb; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#1a1a1a; box-sizing:border-box;">{drug}</div>'
+            f'<div style="padding:6px 10px; font-size:12px; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#374151; line-height:1.5; box-sizing:border-box;">{guidance}</div>'
+            f'</div>'
+        )
+
+
+    # ========================================================================
+    # PAGE 1
+    #
+    # General PGx explanation + types of pharmacogenes.
+    #
+    # We deliberately STOP before "PGx in Everyday Clinical Practice".
+    # This prevents the table from spilling silently onto another physical page.
+    # ========================================================================
+
+    page1_content = f"""
+    <div style="padding-top:10px;">
+
+        <div
+            class="page-title"
+            id="welcome"
+        >
+            About Personalized Medicine
+        </div>
+
+
+        {_h2(
+            "What Is Personalized Medicine and Why Does It Matter?"
+        )}
+
+        {_para(
+            "Medicine has traditionally been prescribed based on "
+            "population averages: a standard drug at a standard dose "
+            "for everyone with the same diagnosis. But we are not all "
+            "the same. Your genes, lifestyle, age, and other biological "
+            "factors shape how your body responds to a medication. "
+            "Personalized medicine, sometimes called precision medicine, "
+            "is an approach that uses these individual differences to "
+            "guide treatment choices."
+        )}
+
+        {_para(
+            "One of the most important drivers of this variability is "
+            "pharmacogenomics (PGx): the study of how your genetic "
+            "makeup influences how your body processes and responds "
+            "to drugs. Even small differences in specific genes can "
+            "change how quickly you break down a drug, how much of it "
+            "reaches your bloodstream, and how strongly you respond to it."
+        )}
+
+        {_para(
+            "Knowing this in advance helps your doctor make smarter "
+            "choices &mdash; potentially avoiding drugs that won't work "
+            "well for you, choosing safer alternatives, or adjusting "
+            "doses before problems arise."
+        )}
+
+
+        {_h2(
+            "Where the Science Stands"
+        )}
+
+        {_para(
+            "Pharmacogenomics is not new; it has been studied for decades, "
+            "but clinical adoption has accelerated dramatically. Today, "
+            "major health institutions around the world use PGx testing "
+            "to guide prescribing in oncology, psychiatry, cardiology, "
+            "infectious disease, and more."
+        )}
+
+        {_para(
+            "Authoritative bodies like CPIC (Clinical Pharmacogenetics "
+            "Implementation Consortium), ClinPGx (formerly PharmGKB), "
+            "and the FDA have published evidence-based guidelines that "
+            "translate genetic findings directly into prescribing "
+            "recommendations."
+        )}
+
+        {_para(
+            "At the same time, the field is still growing. Not every "
+            "drug has robust PGx evidence yet, and not every genetic "
+            "variant has been fully characterized. This is why this "
+            "report is structured carefully: only gene-drug combinations "
+            "with established clinical guidelines are presented as "
+            "actionable recommendations. Everything else is shown "
+            "transparently, with clear explanations of what is and "
+            "isn't yet known."
+        )}
+
+
+        {_h2(
+            "The Different Types of Pharmacogenes"
+        )}
+
+        {_para(
+            "Not all pharmacogenomic genes work the same way. This report "
+            "includes several types of genes, each of which influences "
+            "drug response through a different mechanism. Understanding "
+            "this helps you interpret the phenotype labels you will encounter:"
+        )}
+
+
+        <ul style="
+            font-size:11.5px;
+            color:#374151;
+            line-height:1.6;
+            margin-top:4px;
+            margin-bottom:8px;
+            padding-left:18px;
+        ">
+
+            <li style="margin-bottom:4px;">
+                <strong>
+                    1. Drug-Metabolizing Enzymes
+                    (CYP genes, DPYD, TPMT, NUDT15, UGT1A1)
+                </strong>:
+                These genes encode enzymes that chemically break down drugs
+                in the liver or gut. Variants affect how quickly a drug is
+                cleared from the body. These are described using the
+                metabolizer phenotype framework
+                (Normal, Intermediate, Poor, Rapid/Ultrarapid Metabolizer).
+            </li>
+
+            <li style="margin-bottom:4px;">
+                <strong>
+                    2. Drug Transporter Genes
+                    (SLCO1B1, ABCG2)
+                </strong>:
+                These genes encode proteins that physically move drugs across
+                cell membranes. Variants are described as Decreased Function
+                or Poor Function because the drug is not being metabolized
+                differently &mdash; it is being transported differently.
+            </li>
+
+            <li style="margin-bottom:4px;">
+                <strong>
+                    3. Drug Target / Mechanism Genes
+                    (VKORC1, RYR1, CACNA1S)
+                </strong>:
+                These encode the molecular targets or mechanisms relevant to
+                drug response. Results may therefore use labels other than
+                metabolizer phenotypes.
+            </li>
+
+            <li style="margin-bottom:4px;">
+                <strong>
+                    4. Immune and Hypersensitivity Genes
+                    (HLA-A, HLA-B)
+                </strong>:
+                These genes are involved in immune recognition. Certain
+                alleles are associated with severe immune reactions to
+                specific medications and may require specialized
+                high-resolution typing.
+            </li>
+
+            <li>
+                <strong>
+                    5. Response Prediction Genes
+                    (IFNL3)
+                </strong>:
+                Some genes help predict the likelihood of treatment response
+                rather than primarily predicting toxicity.
+            </li>
+
         </ul>
 
-        {_h2("PGx in Everyday Clinical Practice")}
-        {_para("Pharmacogenomics-guided prescribing is increasingly used in clinical settings. Here are some examples of how PGx information can help inform prescribing:")}
-        <table style="width:100%; border-collapse:collapse; border:none; margin-bottom:12px;">
-            <thead>
-                <tr style="background:#4DB7D0;">
-                    <th style="padding:5px 8px; font-size:12px; font-weight:700; text-align:left; color:white; width:30%;">Drug / Drug Class</th>
-                    <th style="padding:5px 8px; font-size:12px; font-weight:700; text-align:left; color:white;">How PGx Can Guide Prescribing</th>
-                </tr>
-            </thead>
-            <tbody>{table_body}</tbody>
-        </table>
-
-        <div style="border:1px solid #d97706; border-left:4px solid #d97706; border-radius:6px; background:#fffbeb; padding:10px 16px; page-break-inside: avoid; break-inside: avoid;">
-            <div style="font-size:11.5px; font-weight:700; color:#92400e; margin-bottom:4px;">Important to Know</div>
-            <div style="font-size:11.5px; line-height:1.6; color:#374151;">
-                PGx information is one input into a prescribing decision, not a prescription in itself. Your doctor combines this genetic information with your medical history, current medications, organ function, and clinical judgment. This report is designed to support that conversation.
-            </div>
-        </div>
     </div>
     """
-    return _wrap_page(page_content, name, pg, page_id="welcome")
+
+
+    # ========================================================================
+    # PAGE 2
+    #
+    # Clinical examples + safety reminder.
+    # ========================================================================
+
+    page2_content = f"""
+    <div style="padding-top:10px;">
+
+
+        {_h2(
+            "PGx in Everyday Clinical Practice"
+        )}
+
+        {_para(
+            "Pharmacogenomics-guided prescribing is increasingly used "
+            "in clinical settings. The examples below illustrate how "
+            "genetic information can contribute to medication decisions."
+        )}
+
+
+        <div class="intro-safe-grid" style="margin-bottom:14px;">
+            <div class="intro-safe-grid-header" style="display:grid; grid-template-columns:30% 70%; background:#4DB7D0;">
+                <div style="padding:5px 8px; font-size:12px; font-weight:700; text-align:left; color:white; box-sizing:border-box;">Drug / Drug Class</div>
+                <div style="padding:5px 8px; font-size:12px; font-weight:700; text-align:left; color:white; box-sizing:border-box;">How PGx Can Guide Prescribing</div>
+            </div>
+            {table_body}
+        </div>
+
+
+        <div style="
+            border:1px solid #d97706;
+            border-left:4px solid #d97706;
+            border-radius:6px;
+            background:#fffbeb;
+            padding:10px 16px;
+            page-break-inside:avoid;
+            break-inside:avoid;
+        ">
+
+            <div style="
+                font-size:11.5px;
+                font-weight:700;
+                color:#92400e;
+                margin-bottom:4px;
+            ">
+                Important to Know
+            </div>
+
+            <div style="
+                font-size:11.5px;
+                line-height:1.6;
+                color:#374151;
+            ">
+                PGx information is one input into a prescribing decision,
+                not a prescription in itself. Your doctor combines this
+                genetic information with your medical history, current
+                medications, organ function, and clinical judgment.
+                This report is designed to support that conversation.
+            </div>
+
+        </div>
+
+    </div>
+    """
+
+
+    # Let Chromium fill physical pages naturally inside this section.
+    # We keep one logical wrapper so there are no artificial half-empty
+    # continuation pages.
+    combined_content = page1_content + page2_content
+
+    page = _wrap_page(
+        combined_content,
+        name,
+        pg,
+        page_id="welcome",
+        background_color="#f3f4f6"
+    )
+
+    return [page], pg + 1
+
 # ============================================================================
 # 2. HOW TO READ PAGE
 # ============================================================================
 
 def how_to_read_template(name, pg):
+
+    # ========================================================================
+    # Helpers
+    # ========================================================================
+
     def _h2(text):
-        return (f'<div style="font-size:12px; font-weight:700; color:#023D79; '
-                f'margin-top:10px; margin-bottom:4px; padding-bottom:3px; '
-                f'border-bottom:1.5px solid #e5e7eb;">{text}</div>')
-
-    def _para(text):
-        return f'<p style="font-size:11.5px; color:#374151; line-height:1.6; margin-bottom:6px;">{text}</p>'
-
-    def _table2(h1, h2, w1, rows):
-        body = ""
-        for i, (a, b) in enumerate(rows):
-            bg = "#f9fafb" if i % 2 == 0 else "#ffffff"
-            body += (f'<tr style="background:{bg};">'
-                     f'<td style="padding:6px 10px; font-size:12px; font-weight:600; border:1px solid #e5e7eb; '
-                     f'color:#1a1a1a; width:{w1}; vertical-align:top;">{a}</td>'
-                     f'<td style="padding:6px 10px; font-size:12px; border:1px solid #e5e7eb; '
-                     f'color:#374151; line-height:1.5;">{b}</td>'
-                     f'</tr>')
         return (
-            f'<table style="width:100%; border-collapse:collapse; border:none; margin-bottom:12px;">'
-            f'<thead><tr style="background:#4DB7D0;">'
-            f'<th style="padding:5px 8px; font-size:12px; font-weight:700; text-align:left; color:white; width:{w1}; border:1px solid #4DB7D0;">{h1}</th>'
-            f'<th style="padding:5px 8px; font-size:12px; font-weight:700; text-align:left; color:white; border:1px solid #4DB7D0;">{h2}</th>'
-            f'</tr></thead><tbody>{body}</tbody></table>'
+            f'<div style="'
+            f'font-size:12px; '
+            f'font-weight:700; '
+            f'color:#023D79; '
+            f'margin-top:10px; '
+            f'margin-bottom:4px; '
+            f'padding-bottom:3px; '
+            f'border-bottom:1.5px solid #e5e7eb;'
+            f'">'
+            f'{text}'
+            f'</div>'
         )
 
-    def _table3(h1, h2, h3, w1, w2, rows):
-        body = ""
-        for i, (a, b, c) in enumerate(rows):
-            bg = "#f9fafb" if i % 2 == 0 else "#ffffff"
-            body += (f'<tr style="background:{bg};">'
-                     f'<td style="padding:6px 10px; font-size:12px; font-weight:600; border:1px solid #e5e7eb; color:#1a1a1a; width:{w1}; vertical-align:top;">{a}</td>'
-                     f'<td style="padding:6px 10px; font-size:12px; border:1px solid #e5e7eb; color:#374151; line-height:1.5; width:{w2};">{b}</td>'
-                     f'<td style="padding:6px 10px; font-size:12px; border:1px solid #e5e7eb; color:#374151; line-height:1.5;">{c}</td>'
-                     f'</tr>')
+
+    def _para(text):
         return (
-            f'<table style="width:100%; border-collapse:collapse; border:none; margin-bottom:12px;">'
-            f'<thead><tr style="background:#4DB7D0;">'
-            f'<th style="padding:5px 8px; font-size:12px; font-weight:700; text-align:left; color:white; width:{w1}; border:1px solid #4DB7D0;">{h1}</th>'
-            f'<th style="padding:5px 8px; font-size:12px; font-weight:700; text-align:left; color:white; width:{w2}; border:1px solid #4DB7D0;">{h2}</th>'
-            f'<th style="padding:5px 8px; font-size:12px; font-weight:700; text-align:left; color:white; border:1px solid #4DB7D0;">{h3}</th>'
-                f'</tr></thead><tbody>{body}</tbody></table>')
+            f'<p style="'
+            f'font-size:11.5px; '
+            f'color:#374151; '
+            f'line-height:1.6; '
+            f'margin-top:0; '
+            f'margin-bottom:6px;'
+            f'">'
+            f'{text}'
+            f'</p>'
+        )
+
+
+    def _continued_title():
+        # Continuation headings are intentionally omitted. Chromium paginates
+        # this logical section using the actual rendered height.
+        return ""
+
+
+    def _table2(
+        h1,
+        h2,
+        w1,
+        rows
+    ):
+
+        body = ""
+
+
+        for i, (a, b) in enumerate(
+            rows
+        ):
+
+            bg = (
+                "#f9fafb"
+                if i % 2 == 0
+                else "#ffffff"
+            )
+
+
+            body += (
+                f'<div class="intro-safe-row" style="display:grid; grid-template-columns:{w1} 1fr; background:{bg};">'
+                f'<div style="padding:5px 9px; font-size:11.5px; font-weight:600; border-left:1px solid #e5e7eb; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#1a1a1a; box-sizing:border-box;">{a}</div>'
+                f'<div style="padding:5px 9px; font-size:11.5px; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#374151; line-height:1.45; box-sizing:border-box;">{b}</div>'
+                f'</div>'
+            )
+
+
+        return f"""
+        <div class="intro-safe-grid" style="margin-bottom:10px;">
+            <div class="intro-safe-grid-header" style="display:grid; grid-template-columns:{w1} 1fr; background:#4DB7D0;">
+                <div style="padding:5px 8px; font-size:11.5px; font-weight:700; color:white; box-sizing:border-box;">{h1}</div>
+                <div style="padding:5px 8px; font-size:11.5px; font-weight:700; color:white; box-sizing:border-box;">{h2}</div>
+            </div>
+            {body}
+        </div>
+        """
+
+
+    def _table3(
+        h1,
+        h2,
+        h3,
+        w1,
+        w2,
+        rows
+    ):
+
+        body = ""
+
+
+        for i, (a, b, c) in enumerate(
+            rows
+        ):
+
+            bg = (
+                "#f9fafb"
+                if i % 2 == 0
+                else "#ffffff"
+            )
+
+
+            body += (
+                f'<div class="intro-safe-row" style="display:grid; grid-template-columns:{w1} {w2} 1fr; background:{bg};">'
+                f'<div style="padding:5px 8px; font-size:11.5px; font-weight:600; border-left:1px solid #e5e7eb; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#1a1a1a; box-sizing:border-box;">{a}</div>'
+                f'<div style="padding:5px 8px; font-size:11.5px; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#374151; line-height:1.4; box-sizing:border-box;">{b}</div>'
+                f'<div style="padding:5px 8px; font-size:11.5px; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#374151; line-height:1.4; box-sizing:border-box;">{c}</div>'
+                f'</div>'
+            )
+
+
+        return f"""
+        <div class="intro-safe-grid" style="margin-bottom:10px;">
+            <div class="intro-safe-grid-header" style="display:grid; grid-template-columns:{w1} {w2} 1fr; background:#4DB7D0;">
+                <div style="padding:5px 8px; font-size:11.5px; font-weight:700; color:white; box-sizing:border-box;">{h1}</div>
+                <div style="padding:5px 8px; font-size:11.5px; font-weight:700; color:white; box-sizing:border-box;">{h2}</div>
+                <div style="padding:5px 8px; font-size:11.5px; font-weight:700; color:white; box-sizing:border-box;">{h3}</div>
+            </div>
+            {body}
+        </div>
+        """
+
+
+    # ========================================================================
+    # Content tables
+    # ========================================================================
 
     content_rows = [
-        ("Detailed Drug Reports",
-         "For each drug with an established PGx guideline, you will find the genes analyzed, your genotype and phenotype, a plain-language explanation of what it means for you, and the clinical recommendation from recognized guidelines."),
-        ("Other Evaluated Medications",
-         "Drugs that were evaluated but do not have a specific clinical action or recommendation. This occurs either because the genetic data was missing or insufficient (shown as 'Unknown/Unknown'), or because current guidelines do not issue an actionable recommendation for your specific result. These are included for transparency."),
-        ("No Guideline Available",
-         "Drugs where a relevant gene was identified and partially assessed, but current guidelines do not yet provide specific dosing or management recommendations for this gene-drug combination."),
-        ("Genes Requiring Specialized Testing",
-         "Genes that could not be assessed from your submitted DNA data, the reason why, and the clinical significance of the missing information."),
-        ("Genotype Summary",
-         "A consolidated table of all genes tested, your diplotypes, and resulting phenotypes. A single-page genetic reference your clinician can consult over time."),
+
+        (
+            "Detailed Drug Reports",
+
+            "For each drug with an established PGx guideline, you will find "
+            "the genes analyzed, your genotype and phenotype, a plain-language "
+            "explanation of what it means for you, and the clinical "
+            "recommendation from recognized guidelines."
+        ),
+
+        (
+            "Other Evaluated Medications",
+
+            "Drugs that were evaluated but do not have a specific clinical "
+            "action or recommendation in this report. This may occur because "
+            "the relevant genetic result was unavailable or because the "
+            "available evidence does not produce a patient-specific clinical "
+            "recommendation."
+        ),
+
+        (
+            "No Guideline Available",
+
+            "Drugs for which a relevant gene-drug relationship was identified "
+            "but no formal prescribing recommendation is available for the "
+            "specific result represented in this report."
+        ),
+
+        (
+            "Genes Requiring Specialized Testing",
+
+            "Genes that could not be reliably assessed from the submitted DNA "
+            "data, together with the reason and the medications for which the "
+            "missing information may be relevant."
+        ),
+
+        (
+            "Genotype Summary",
+
+            "A consolidated reference of the genes evaluated, reported "
+            "diplotypes, and resulting phenotypes for this sample."
+        ),
     ]
+
+
     key_terms = [
-        ("Gene",
-         "The specific gene being analyzed. Genes provide the instructions for producing enzymes and proteins involved in drug metabolism and transport."),
-        ("Diplotype",
-         "Your specific combination of genetic variants for that gene (e.g., *1/*2). Each person inherits one copy of a gene from each parent, so the diplotype reflects both copies together."),
-        ("Phenotype",
-         "What your diplotype means functionally &mdash; in other words, how your enzyme or protein is likely to behave. Common phenotypes include Normal Metabolizer, Intermediate Metabolizer, Poor Metabolizer, and Rapid/Ultrarapid Metabolizer."),
+
+        (
+            "Gene",
+
+            "The specific gene being analyzed. Genes provide instructions "
+            "for producing enzymes, transporters, receptors, and other "
+            "proteins that can influence medication response."
+        ),
+
+        (
+            "Diplotype",
+
+            "Your reported combination of genetic alleles for that gene "
+            "(for example, *1/*2). The exact notation depends on the gene "
+            "and the allele-definition system used."
+        ),
+
+        (
+            "Phenotype",
+
+            "The predicted functional interpretation of the genetic result. "
+            "Examples include Normal Metabolizer, Intermediate Metabolizer, "
+            "Poor Metabolizer, Normal Function, or other gene-specific "
+            "functional labels."
+        ),
     ]
+
+
     sources = [
-        ("CPIC (Clinical Pharmacogenetics Implementation Consortium)",
-         "Peer-reviewed, expert-developed guidelines specifically designed to help clinicians use PGx test results in prescribing decisions. Available at cpicpgx.org",
-         "Letters A&ndash;D. A/B = strong or moderate evidence with clear actions. C/D = weaker or informational evidence."),
-        ("DPWG (Dutch Pharmacogenetics Working Group)",
-         "Evidence-based PGx guidelines developed by clinical pharmacy and genetics experts. DPWG guidelines follow a parallel development process to CPIC and are widely used in European clinical settings. For drugs where CPIC has not issued a guideline, DPWG recommendations are used.",
-         "Strength categories comparable to CPIC; noted explicitly per drug."),
-        ("ClinPGx (formerly PharmGKB)",
-         "A curated database of gene-drug associations and their supporting evidence from published research. ClinPGx provides evidence summaries and pathway data that underpin guideline development. Available at clinpgx.org",
-         "Levels 1A&ndash;4. Level 1A/1B = highest confidence, supported by clinical guidelines or replicated studies."),
-        ("FDA (U.S. Food and Drug Administration)",
-         "Official drug-label annotations indicating that genetic information is relevant to prescribing.",
-         "Tags such as 'Actionable PGx' or 'Testing Recommended/Required' appear on the drug label."),
+
+        (
+            "CPIC",
+
+            "Peer-reviewed pharmacogenomic guidelines developed to help "
+            "clinicians use available genetic test results in prescribing "
+            "decisions.",
+
+            "Recommendation strength and evidence are shown where available."
+        ),
+
+        (
+            "DPWG",
+
+            "Evidence-based pharmacogenomic recommendations developed by "
+            "the Dutch Pharmacogenetics Working Group.",
+
+            "Used where relevant recommendations are available."
+        ),
+
+        (
+            "ClinPGx",
+
+            "A curated resource of pharmacogenomic gene-drug associations, "
+            "guideline information, and supporting evidence.",
+
+            "Evidence annotations may be displayed where available."
+        ),
+
+        (
+            "FDA",
+
+            "Drug-label and pharmacogenomic information published by the "
+            "U.S. Food and Drug Administration.",
+
+            "FDA testing or actionable-PGx information may be displayed "
+            "when applicable."
+        ),
     ]
 
-    page_content = f"""
-    <div style="padding-top: 10px;">
-        <div class="page-title" id="how_to_read">About This Report</div>
 
-        {_h2("What This Report Contains")}
-        {_para("This is a pharmacogenomics (PGx) report that examines how your genetic variants may influence your response to a range of medications. It is organized into the following sections:")}
-        {_table2("Section", "What It Tells You", "32%", content_rows)}
+    # ========================================================================
+    # PAGE 1
+    #
+    # Report structure + distinction between the two non-detailed sections.
+    # ========================================================================
 
-        {_h2("The Difference Between 'No Guideline Available' and 'Other Evaluated Medications'")}
-        {_para("These two sections are distinct and should not be confused:")}
-        {_para("<strong>No Guideline Available:</strong> The gene was analyzed, a result was obtained, and the gene-drug relationship is known &mdash; but no formal prescribing guideline has been issued yet by CPIC, DPWG, or other recognized bodies for this specific combination. The gene data exists and may become clinically actionable as evidence evolves.")}
-        {_para("<strong>Other Evaluated Medications:</strong> The drug is listed because it was evaluated against your genetic profile, but no clinical action is currently recommended. This happens for two main reasons: either the genetic data for the relevant gene was missing/insufficient (shown as 'Unknown/Unknown' in the diplotype column), or the current guidelines do not issue an actionable recommendation for your specific genotype. These entries carry no clinical recommendation.")}
+    page1_content = f"""
+    <div style="padding-top:10px;">
 
-        {_h2("What Do the Key Terms Mean?")}
-        {_para("Each drug entry in the report includes a Genes Analyzed table with three columns. Here is what each one means:")}
-        {_table2("Term", "Plain-Language Explanation", "20%", key_terms)}
-
-        {_h2("Where Do the Recommendations Come From?")}
-        {_para("All clinical recommendations in this report are sourced from one or more of the following internationally recognized evidence bases:")}
-        {_table3("Source", "What It Provides", "Evidence Level You Will See", "22%", "48%", sources)}
-
-        {_h2("A Note on the GSI Catalog")}
-        {_para("In many drug entries, you will see a note that additional genes 'are known to affect this drug\'s metabolism (GSI catalog).' The GSI (Gene-Specific Information) catalog is the reference database used by PharmCAT to identify which pharmacogenes are associated with each drug, drawing from literature and database curation beyond what CPIC has issued formal guidelines for. These genes are listed for informational completeness &mdash; they represent known associations in the literature &mdash; but they were either not assessed by PharmCAT in this pipeline or could not be called from the submitted data.")}
-
-        {_h2("How Were Your Results Generated?")}
-        {_para("Your results were derived from the raw DNA data file you submitted. This file was analyzed using <strong>PharmCAT v3.2.0</strong> (Pharmacogenomics Clinical Annotation Tool), a validated pharmacogenomics analysis tool, which identified your variants across the relevant pharmacogenes and matched them to established allele definitions from CPIC and other guidelines.")}
-        {_para("Your genotype (the specific variants you carry) was then translated into a phenotype (the functional consequence of those variants) and linked to the appropriate clinical guideline recommendations.")}
-
-        {_h2("Guideline Currency")}
-        {_para("Pharmacogenomics guidelines are updated regularly as new evidence is published. The recommendations in this report reflect the versions of the CPIC, DPWG, and FDA guidelines incorporated in the PharmCAT v3.2.0 pipeline at the time this report was generated. For high-stakes prescribing decisions, clinicians may wish to check cpicpgx.org or clinpgx.org directly for the most recent guideline version.")}
-
-        <div style="border:1px solid #dc2626; border-left:4px solid #dc2626; border-radius:6px; background:#fef2f2; padding:10px 16px; margin-top:4px; page-break-inside: avoid; break-inside: avoid;">
-            <div style="font-size:11.5px; font-weight:700; color:#991b1b; margin-bottom:4px;">Technical Limitations</div>
-            <div style="font-size:11.5px; line-height:1.6; color:#374151;">
-                Some genes, particularly CYP2D6, HLA-A, HLA-B, MT-RNR1, CYP2C9, CYP2C19, CYP2B6, TPMT, NAT2, and CFTR, cannot be reliably analyzed from a standard SNP array genotyping file due to structural complexity, copy-number variation, or the need for specialized sequencing methods. These genes appear in the Genes Requiring Specialized Testing section with a full explanation of why each could not be called and the clinical consequences for affected medications. For certain high-stakes drug decisions that depend on these genes, your doctor may recommend targeted testing.
-            </div>
+        <div
+            class="page-title"
+            id="how_to_read"
+        >
+            About This Report
         </div>
+
+
+        {_h2(
+            "What This Report Contains"
+        )}
+
+        {_para(
+            "This is a pharmacogenomics (PGx) report that examines how "
+            "genetic variation may influence response to a range of "
+            "medications. The report is organized into the following sections:"
+        )}
+
+
+        {_table2(
+            "Section",
+            "What It Tells You",
+            "32%",
+            content_rows
+        )}
+
+
+
+        {_h2(
+            "The Difference Between "
+            "'No Guideline Available' and "
+            "'Other Evaluated Medications'"
+        )}
+
+        {_para(
+            "These two sections serve different purposes and should not "
+            "be interpreted as equivalent."
+        )}
+
+        {_para(
+            "<strong>No Guideline Available:</strong> "
+            "A relevant gene-drug relationship was identified, but the "
+            "available guideline information does not provide a specific "
+            "patient-management recommendation for the result shown in "
+            "this report."
+        )}
+
+        {_para(
+            "<strong>Other Evaluated Medications:</strong> "
+            "The medication was evaluated against the available genetic "
+            "information but is not presented as a detailed actionable "
+            "drug report. This may occur because the relevant genetic "
+            "result was unavailable or because the evaluated result does "
+            "not generate a patient-specific clinical recommendation."
+        )}
+
+
+        <div style="
+            border:1px solid #4DB7D0;
+            border-left:4px solid #4DB7D0;
+            border-radius:6px;
+            background:#f0fffe;
+            padding:9px 14px;
+            margin-top:10px;
+            page-break-inside:avoid;
+            break-inside:avoid;
+        ">
+
+            <div style="
+                font-size:11.5px;
+                font-weight:700;
+                color:#023D79;
+                margin-bottom:3px;
+            ">
+                Important
+            </div>
+
+            <div style="
+                font-size:11.5px;
+                line-height:1.55;
+                color:#374151;
+            ">
+                A medication appearing in either of these sections should
+                not be interpreted as safe, unsafe, effective, or
+                ineffective based on genetics alone. Medication decisions
+                should always incorporate the full clinical picture.
+            </div>
+
+        </div>
+
     </div>
     """
-    
-    # Split the long content into two pages to avoid overflow
-    # Let's split after "What Do the Key Terms Mean?" section
-    
-    split_token = "Where Do the Recommendations Come From?"
-    parts = page_content.split(_h2(split_token))
-    
-    page1_content = parts[0] + "</div>"
-    page2_content = f"""<div style="padding-top: 10px;">""" + _h2(split_token) + parts[1]
 
-    pg1 = _wrap_page(page1_content, name, pg, page_id="how_to_read")
-    pg2 = _wrap_page(page2_content, name, pg + 1)
-    
-    return [pg1, pg2], pg + 2
+
+    # ========================================================================
+    # PAGE 2
+    #
+    # Key terminology + *1/reference explanation + evidence sources.
+    # ========================================================================
+
+    page2_content = f"""
+    <div style="padding-top:10px;">
+
+        {_continued_title()}
+
+
+        {_h2(
+            "What Do the Key Terms Mean?"
+        )}
+
+        {_para(
+            "Drug-specific entries use genetic terminology to describe "
+            "what was evaluated and how the result was interpreted."
+        )}
+
+
+        {_table2(
+            "Term",
+            "Plain-Language Explanation",
+            "20%",
+            key_terms
+        )}
+
+
+        {_h2(
+            "About *1 and Reference Results"
+        )}
+
+        {_para(
+            "A *1 or Reference result means that no defining alternative "
+            "allele was identified at the relevant positions available "
+            "for analysis. Because raw DNA files may not contain every "
+            "position used to define an allele, a *1 or Reference result "
+            "does not mean that the entire gene was sequenced or that all "
+            "possible variants were excluded. Results should be interpreted "
+            "within the marker coverage of the submitted DNA file."
+        )}
+
+
+        {_h2(
+            "Where Do the Recommendations Come From?"
+        )}
+
+        {_para(
+            "Clinical recommendations and evidence annotations in this "
+            "report may be derived from the following recognized "
+            "pharmacogenomic resources:"
+        )}
+
+
+        {_table3(
+            "Source",
+            "What It Provides",
+            "How It Is Used in This Report",
+            "18%",
+            "47%",
+            sources
+        )}
+
+    </div>
+    """
+
+
+    # ========================================================================
+    # PAGE 3
+    #
+    # GSI + analysis method + currency + limitations.
+    # ========================================================================
+
+    page3_content = f"""
+    <div style="padding-top:10px;">
+
+        {_continued_title()}
+
+
+        {_h2(
+            "A Note on the GSI Catalog"
+        )}
+
+        {_para(
+            "The GSI catalog is an additional curated reference used by "
+            "this report-generation pipeline to identify genes that have "
+            "reported associations with a medication beyond the gene-drug "
+            "pairs for which a formal prescribing recommendation is shown. "
+            "These associations may relate to metabolism, transport, "
+            "toxicity, treatment response, or another pharmacogenomic "
+            "mechanism."
+        )}
+
+        {_para(
+            "Genes listed as additional GSI-associated genes are included "
+            "for informational completeness. Their presence does not mean "
+            "that PharmCAT analyzed that gene-drug pair or that a clinical "
+            "prescribing recommendation is available."
+        )}
+
+
+        {_h2(
+            "How Were Your Results Generated?"
+        )}
+
+        {_para(
+            "Your results were generated from the raw DNA data file "
+            "submitted for analysis. Available pharmacogenomic markers "
+            "were processed through the report pipeline, including "
+            "<strong>PharmCAT v3.2.0</strong>, to derive supported genetic "
+            "calls and phenotype interpretations for applicable genes."
+        )}
+
+        {_para(
+            "The resulting genetic information was then matched against "
+            "available pharmacogenomic recommendations and supporting "
+            "reference data to determine which medication findings could "
+            "be presented in this report."
+        )}
+
+        {_h2(
+                    "How This Report Is Structured"
+                )}
+        
+                {_para(
+                    "The report begins with guidance on interpreting "
+                    "pharmacogenomic results, followed by a summary of medication "
+                    "insights and detailed recommendations organized by therapeutic "
+                    "category. Medications relevant to multiple categories are "
+                    "grouped together, with a single shared recommendation, while "
+                    "the Table of Contents lists them under each applicable "
+                    "category and page number. Additional sections include other "
+                    "evaluated medications, genes requiring specialized testing, "
+                    "and a consolidated genotype summary."
+                )}
+        
+
+
+        {_h2(
+            "Guideline Currency"
+        )}
+
+        {_para(
+            "Pharmacogenomic guidelines and drug-label information can "
+            "change as new evidence becomes available. The recommendations "
+            "shown in this report reflect the guideline and reference data "
+            "used by the analysis pipeline at the time the report was "
+            "generated. For high-stakes prescribing decisions, clinicians "
+            "should confirm that they are using the most current applicable "
+            "guideline or prescribing information."
+        )}
+
+
+        <div style="
+            border:1px solid #dc2626;
+            border-left:4px solid #dc2626;
+            border-radius:6px;
+            background:#fef2f2;
+            padding:10px 16px;
+            margin-top:12px;
+            page-break-inside:avoid;
+            break-inside:avoid;
+        ">
+
+            <div style="
+                font-size:11.5px;
+                font-weight:700;
+                color:#991b1b;
+                margin-bottom:4px;
+            ">
+                Technical Limitations
+            </div>
+
+            <div style="
+                font-size:11.5px;
+                line-height:1.6;
+                color:#374151;
+            ">
+
+                Coverage varies by gene and by the raw DNA platform used.
+                Some pharmacogenes can be assessed when the required
+                markers are present, while others cannot be fully or
+                reliably characterized from standard SNP-array data.
+
+                <br><br>
+
+                Structurally complex genes, copy-number changes,
+                high-resolution HLA alleles, certain mitochondrial
+                variants, and rare variants may require dedicated
+                clinical testing or sequencing methods.
+
+                <br><br>
+
+                Any gene that could not be reliably assessed for this
+                sample is identified separately in the
+                <strong>Genes Requiring Specialized Testing</strong>
+                section. A missing or indeterminate result should not be
+                interpreted as a normal genetic result.
+
+            </div>
+
+        </div>
+
+    </div>
+    """
+
+
+    # Keep the complete section in one logical wrapper. Chromium may use
+    # as many physical PDF pages as needed and will use the remaining space
+    # on each page before continuing.
+    combined_content = (
+        page1_content
+        + page2_content
+        + page3_content
+    )
+
+    page = _wrap_page(
+        combined_content,
+        name,
+        pg,
+        page_id="how_to_read",
+        background_color="#f3f4f6"
+    )
+
+    return [page], pg + 1
+
 # ============================================================================
 # 3. FAQs PAGE
 # ============================================================================
@@ -823,6 +2614,11 @@ def faqs_template(name, pg):
 
     def _para(text):
         return f'<p style="font-size:11.5px; color:#374151; line-height:1.6; margin-bottom:6px;">{text}</p>'
+
+    def _continued_title():
+        # No forced continuation title. The section flows naturally across
+        # physical PDF pages.
+        return ""
 
     pheno_rows = [
         ("Normal (Extensive) Metabolizer",
@@ -847,11 +2643,11 @@ def faqs_template(name, pg):
     pheno_body = ""
     for i, (pheno, meaning, implication) in enumerate(pheno_rows):
         bg = "#f9fafb" if i % 2 == 0 else "#ffffff"
-        pheno_body += (f'<tr style="background:{bg};">'
-                       f'<td style="padding:5px 8px; font-size:12px; font-weight:600; border:1px solid #e5e7eb; color:#1a1a1a; width:24%; vertical-align:top;">{pheno}</td>'
-                       f'<td style="padding:5px 8px; font-size:12px; border:1px solid #e5e7eb; color:#374151; line-height:1.5; width:36%;">{meaning}</td>'
-                       f'<td style="padding:5px 8px; font-size:12px; border:1px solid #e5e7eb; color:#374151; line-height:1.5;">{implication}</td>'
-                       f'</tr>')
+        pheno_body += (f'<div class="intro-safe-row" style="display:grid; grid-template-columns:24% 36% 40%; background:{bg};">'
+                       f'<div style="padding:5px 8px; font-size:12px; font-weight:600; border-left:1px solid #e5e7eb; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#1a1a1a; box-sizing:border-box;">{pheno}</div>'
+                       f'<div style="padding:5px 8px; font-size:12px; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#374151; line-height:1.5; box-sizing:border-box;">{meaning}</div>'
+                       f'<div style="padding:5px 8px; font-size:12px; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#374151; line-height:1.5; box-sizing:border-box;">{implication}</div>'
+                       f'</div>')
 
     transporter_rows = [
         ("Normal Function",
@@ -867,11 +2663,11 @@ def faqs_template(name, pg):
     transporter_body = ""
     for i, (pheno, meaning, implication) in enumerate(transporter_rows):
         bg = "#f9fafb" if i % 2 == 0 else "#ffffff"
-        transporter_body += (f'<tr style="background:{bg};">'
-                       f'<td style="padding:5px 8px; font-size:12px; font-weight:600; border:1px solid #e5e7eb; color:#1a1a1a; width:24%; vertical-align:top;">{pheno}</td>'
-                       f'<td style="padding:5px 8px; font-size:12px; border:1px solid #e5e7eb; color:#374151; line-height:1.5; width:36%;">{meaning}</td>'
-                       f'<td style="padding:5px 8px; font-size:12px; border:1px solid #e5e7eb; color:#374151; line-height:1.5;">{implication}</td>'
-                       f'</tr>')
+        transporter_body += (f'<div class="intro-safe-row" style="display:grid; grid-template-columns:24% 36% 40%; background:{bg};">'
+                       f'<div style="padding:5px 8px; font-size:12px; font-weight:600; border-left:1px solid #e5e7eb; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#1a1a1a; box-sizing:border-box;">{pheno}</div>'
+                       f'<div style="padding:5px 8px; font-size:12px; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#374151; line-height:1.5; box-sizing:border-box;">{meaning}</div>'
+                       f'<div style="padding:5px 8px; font-size:12px; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#374151; line-height:1.5; box-sizing:border-box;">{implication}</div>'
+                       f'</div>')
 
     susc_rows = [
         ("Malignant Hyperthermia Susceptibility", "RYR1, CACNA1S",
@@ -882,17 +2678,17 @@ def faqs_template(name, pg):
          "If an RYR1 susceptibility is already confirmed, the same anesthetic precautions already apply. The CACNA1S 'uncertain' result means the standard SNP array cannot rule out structural or rare CACNA1S variants. If independent confirmation is needed, in vitro contracture testing (IVCT) can be requested."),
         ("Adverse Reaction Risk", "HLA-B",
          "Certain HLA-B alleles are strongly associated with severe cutaneous adverse reactions (Stevens-Johnson syndrome / toxic epidermal necrolysis) with specific drugs.",
-         "HLA-B cannot be called from standard SNP array data and requires specialized high-resolution HLA typing before prescribing the affected drugs (see Genes Requiring Specialized Testing).")
+         "High-resolution HLA allele status generally cannot be established reliably from a standard consumer SNP-array file. When an HLA-B result is clinically required for prescribing, dedicated validated HLA testing may be necessary.")
     ]
     susc_body = ""
     for i, (pheno, genes, meaning, implication) in enumerate(susc_rows):
         bg = "#f9fafb" if i % 2 == 0 else "#ffffff"
-        susc_body += (f'<tr style="background:{bg};">'
-                       f'<td style="padding:5px 8px; font-size:12px; font-weight:600; border:1px solid #e5e7eb; color:#1a1a1a; width:20%; vertical-align:top;">{pheno}</td>'
-                       f'<td style="padding:5px 8px; font-size:12px; font-weight:600; border:1px solid #e5e7eb; color:#1e40af; width:10%; vertical-align:top;">{genes}</td>'
-                       f'<td style="padding:5px 8px; font-size:12px; border:1px solid #e5e7eb; color:#374151; line-height:1.5; width:40%;">{meaning}</td>'
-                       f'<td style="padding:5px 8px; font-size:12px; border:1px solid #e5e7eb; color:#374151; line-height:1.5;">{implication}</td>'
-                       f'</tr>')
+        susc_body += (f'<div class="intro-safe-row" style="display:grid; grid-template-columns:20% 10% 40% 30%; background:{bg};">'
+                       f'<div style="padding:5px 8px; font-size:12px; font-weight:600; border-left:1px solid #e5e7eb; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#1a1a1a; box-sizing:border-box;">{pheno}</div>'
+                       f'<div style="padding:5px 8px; font-size:12px; font-weight:600; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#1e40af; box-sizing:border-box;">{genes}</div>'
+                       f'<div style="padding:5px 8px; font-size:12px; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#374151; line-height:1.5; box-sizing:border-box;">{meaning}</div>'
+                       f'<div style="padding:5px 8px; font-size:12px; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#374151; line-height:1.5; box-sizing:border-box;">{implication}</div>'
+                       f'</div>')
 
     variant_rows = [
         ("VKORC1", "Reported as: -1639 G/A (rs9923231 C/T)",
@@ -905,11 +2701,13 @@ def faqs_template(name, pg):
     variant_body = ""
     for i, (gene, pfmt, meaning) in enumerate(variant_rows):
         bg = "#f9fafb" if i % 2 == 0 else "#ffffff"
-        variant_body += (f'<tr style="background:{bg};">'
-                       f'<td style="padding:5px 8px; font-size:12px; font-weight:600; border:1px solid #e5e7eb; color:#1e40af; width:15%; vertical-align:top;">{gene}</td>'
-                       f'<td style="padding:5px 8px; font-size:12px; border:1px solid #e5e7eb; color:#374151; line-height:1.5; width:35%;">{pfmt}</td>'
-                       f'<td style="padding:5px 8px; font-size:12px; border:1px solid #e5e7eb; color:#374151; line-height:1.5;">{meaning}</td>'
-                       f'</tr>')
+        variant_body += (
+            f'<div class="intro-safe-row" style="display:grid; grid-template-columns:15% 35% 50%; background:{bg};">'
+            f'<div style="padding:5px 8px; font-size:12px; font-weight:600; border-left:1px solid #e5e7eb; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#1e40af; box-sizing:border-box;">{gene}</div>'
+            f'<div style="padding:5px 8px; font-size:12px; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#374151; line-height:1.5; box-sizing:border-box;">{pfmt}</div>'
+            f'<div style="padding:5px 8px; font-size:12px; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#374151; line-height:1.5; box-sizing:border-box;">{meaning}</div>'
+            f'</div>'
+        )
 
     dpyd_rows = [
         ("2.0", "Normal Metabolizer", "Standard dosing is appropriate."),
@@ -921,11 +2719,11 @@ def faqs_template(name, pg):
     dpyd_body = ""
     for i, (asc, pheno, implication) in enumerate(dpyd_rows):
         bg = "#f9fafb" if i % 2 == 0 else "#ffffff"
-        dpyd_body += (f'<tr style="background:{bg};">'
-                       f'<td style="padding:5px 8px; font-size:12px; font-weight:600; border:1px solid #e5e7eb; color:#1a1a1a; width:15%; vertical-align:top; text-align:center;">{asc}</td>'
-                       f'<td style="padding:5px 8px; font-size:12px; border:1px solid #e5e7eb; color:#374151; line-height:1.5; width:35%;">{pheno}</td>'
-                       f'<td style="padding:5px 8px; font-size:12px; border:1px solid #e5e7eb; color:#374151; line-height:1.5;">{implication}</td>'
-                       f'</tr>')
+        dpyd_body += (f'<div class="intro-safe-row" style="display:grid; grid-template-columns:15% 35% 50%; background:{bg};">'
+                       f'<div style="padding:5px 8px; font-size:12px; font-weight:600; text-align:center; border-left:1px solid #e5e7eb; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#1a1a1a; box-sizing:border-box;">{asc}</div>'
+                       f'<div style="padding:5px 8px; font-size:12px; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#374151; line-height:1.5; box-sizing:border-box;">{pheno}</div>'
+                       f'<div style="padding:5px 8px; font-size:12px; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#374151; line-height:1.5; box-sizing:border-box;">{implication}</div>'
+                       f'</div>')
 
     rec_rows = [
         ("Dose adjustment",
@@ -940,86 +2738,124 @@ def faqs_template(name, pg):
     rec_body = ""
     for i, (rtype, meaning) in enumerate(rec_rows):
         bg = "#f9fafb" if i % 2 == 0 else "#ffffff"
-        rec_body += (f'<tr style="background:{bg};">'
-                     f'<td style="padding:5px 8px; font-size:12px; font-weight:600; border:1px solid #e5e7eb; color:#1a1a1a; width:28%; vertical-align:top;">{rtype}</td>'
-                     f'<td style="padding:5px 8px; font-size:12px; border:1px solid #e5e7eb; color:#374151; line-height:1.5;">{meaning}</td>'
-                     f'</tr>')
+        rec_body += (f'<div class="intro-safe-row" style="display:grid; grid-template-columns:28% 72%; background:{bg};">'
+                     f'<div style="padding:5px 8px; font-size:12px; font-weight:600; border-left:1px solid #e5e7eb; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#1a1a1a; box-sizing:border-box;">{rtype}</div>'
+                     f'<div style="padding:5px 8px; font-size:12px; border-right:1px solid #e5e7eb; border-bottom:1px solid #e5e7eb; color:#374151; line-height:1.5; box-sizing:border-box;">{meaning}</div>'
+                     f'</div>')
+
+    # ========================================================================
+    # PAGE 1
+    # Metabolizer + transporter phenotypes only.
+    # ========================================================================
 
     page_content1 = f"""
-    <div style="padding-top: 10px;">
-        <div class="page-title" id="faqs">How to Understand Your Results</div>
+    <div style="padding-top:10px;">
+
+        <div
+            class="page-title"
+            id="faqs"
+        >
+            How to Understand Your Results
+        </div>
 
         {_h2("Understanding Metabolizer Phenotypes")}
-        {_para("Most pharmacogenomics results for drug-metabolizing enzyme genes are expressed as a metabolizer status. This describes how efficiently your enzyme breaks down a particular drug.")}
-        <table style="width:100%; border-collapse:collapse; border:none; margin-bottom:10px;">
-            <thead>
-                <tr style="background:#4DB7D0;">
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; width:24%; border:1px solid #4DB7D0;">Phenotype</th>
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; width:36%; border:1px solid #4DB7D0;">What It Means</th>
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; border:1px solid #4DB7D0;">Common Clinical Implication</th>
-                </tr>
-            </thead>
-            <tbody>{pheno_body}</tbody>
-        </table>
+
+        {_para(
+            "Most pharmacogenomics results for drug-metabolizing enzyme "
+            "genes are expressed as a metabolizer status. This describes "
+            "how efficiently your enzyme breaks down a particular drug."
+        )}
+
+        <div class="intro-safe-grid" style="margin-bottom:10px;">
+            <div class="intro-safe-grid-header" style="display:grid; grid-template-columns:24% 36% 40%; background:#4DB7D0;">
+                <div style="padding:4px 6px; font-size:12px; font-weight:700; color:white;">Phenotype</div><div style="padding:4px 6px; font-size:12px; font-weight:700; color:white;">What It Means</div><div style="padding:4px 6px; font-size:12px; font-weight:700; color:white;">Common Clinical Implication</div>
+            </div>{pheno_body}
+        </div>
 
         {_h2("Understanding Transporter Function Phenotypes")}
-        {_para("Transporter genes (such as SLCO1B1 and ABCG2) use a different phenotype vocabulary because they move drugs into and out of cells rather than metabolizing them:")}
-        <table style="width:100%; border-collapse:collapse; border:none; margin-bottom:6px;">
-            <thead>
-                <tr style="background:#4DB7D0;">
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; width:24%; border:1px solid #4DB7D0;">Phenotype</th>
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; width:36%; border:1px solid #4DB7D0;">What It Means</th>
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; border:1px solid #4DB7D0;">Common Clinical Implication</th>
-                </tr>
-            </thead>
-            <tbody>{transporter_body}</tbody>
-        </table>
-        {_para("<strong>Why the same SLCO1B1 result leads to different actions for different statins:</strong> SLCO1B1 Decreased Function (e.g., diplotype *1/*5) leads to higher plasma statin concentrations. However, the clinical action varies by statin because simvastatin and lovastatin carry a higher absolute myopathy risk per unit of exposure increase compared to pravastatin, which has a lower risk at equivalent concentrations. This is why the same genetic result can lead to 'Action Required' for one statin and 'Use With Caution' for another.")}
 
-        {_h2("Understanding Susceptibility Phenotypes")}
-        {_para("Some genes in this report do not affect how a drug is metabolized &mdash; they indicate susceptibility to a severe physiological or immune reaction if certain drugs are used.")}
-        <table style="width:100%; border-collapse:collapse; border:none; margin-bottom:10px;">
-            <thead>
-                <tr style="background:#4DB7D0;">
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; width:20%; border:1px solid #4DB7D0;">Phenotype</th>
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; width:10%; border:1px solid #4DB7D0;">Gene(s)</th>
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; width:40%; border:1px solid #4DB7D0;">What It Means</th>
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; border:1px solid #4DB7D0;">Clinical Implication</th>
-                </tr>
-            </thead>
-            <tbody>{susc_body}</tbody>
-        </table>
+        {_para(
+            "Transporter genes such as SLCO1B1 and ABCG2 use a different "
+            "phenotype vocabulary because they move drugs into and out "
+            "of cells rather than metabolizing them."
+        )}
+
+        <div class="intro-safe-grid" style="margin-bottom:6px;">
+            <div class="intro-safe-grid-header" style="display:grid; grid-template-columns:24% 36% 40%; background:#4DB7D0;">
+                <div style="padding:4px 6px; font-size:12px; font-weight:700; color:white;">Phenotype</div><div style="padding:4px 6px; font-size:12px; font-weight:700; color:white;">What It Means</div><div style="padding:4px 6px; font-size:12px; font-weight:700; color:white;">Common Clinical Implication</div>
+            </div>{transporter_body}
+        </div>
 
     </div>
     """
 
+    # ========================================================================
+    # PAGE 2
+    # SLCO1B1 example + susceptibility phenotypes.
+    # ========================================================================
+
     page_content2 = f"""
-    <div style="padding-top: 10px;">
+    <div style="padding-top:10px;">
+
+        {_continued_title()}
+
+        {_h2(
+            "Why Can the Same Genetic Result Lead to Different "
+            "Recommendations for Different Drugs?"
+        )}
+
+        {_para(
+            "<strong>Example: SLCO1B1 and statins.</strong> "
+            "An SLCO1B1 Decreased Function result can increase plasma "
+            "exposure to several statins. However, the clinical action "
+            "is not identical for every statin because each medication "
+            "has a different baseline exposure-response relationship "
+            "and risk profile. For example, simvastatin and lovastatin "
+            "may carry greater concern for muscle toxicity at increased "
+            "exposure than some other statins. This is why the same "
+            "genetic result can lead to different recommendations for "
+            "different medications."
+        )}
+
+        {_h2("Understanding Susceptibility Phenotypes")}
+
+        {_para(
+            "Some genes in this report do not primarily affect how a drug "
+            "is metabolized. Instead, certain variants can indicate "
+            "susceptibility to a physiological or immune-mediated adverse "
+            "reaction when specific medications are used."
+        )}
+
+        <div class="intro-safe-grid" style="margin-bottom:10px;">
+            <div class="intro-safe-grid-header" style="display:grid; grid-template-columns:20% 10% 40% 30%; background:#4DB7D0;">
+                <div style="padding:4px 6px; font-size:12px; font-weight:700; color:white;">Phenotype</div><div style="padding:4px 6px; font-size:12px; font-weight:700; color:white;">Gene(s)</div><div style="padding:4px 6px; font-size:12px; font-weight:700; color:white;">What It Means</div><div style="padding:4px 6px; font-size:12px; font-weight:700; color:white;">Clinical Implication</div>
+            </div>{susc_body}
+        </div>
+
+    </div>
+    """
+
+    page_content3 = f"""
+    <div style="padding-top:10px;">
+        {_continued_title()}
         {_h2("Variant-Classified Genes (Not Metabolizer-Based)")}
         {_para("The following genes do not fit the metabolizer or transporter framework. Their results are reported as specific variant names or genotype calls rather than phenotype categories:")}
-        <table style="width:100%; border-collapse:collapse; border:none; margin-bottom:10px;">
-            <thead>
-                <tr style="background:#4DB7D0;">
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; width:15%; border:1px solid #4DB7D0;">Gene</th>
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; width:35%; border:1px solid #4DB7D0;">Phenotype Format</th>
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; border:1px solid #4DB7D0;">What It Means</th>
-                </tr>
-            </thead>
-            <tbody>{variant_body}</tbody>
-        </table>
+        <div class="intro-safe-grid" style="margin-bottom:10px;">
+            <div class="intro-safe-grid-header" style="display:grid; grid-template-columns:15% 35% 50%; background:#4DB7D0;">
+                <div style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; box-sizing:border-box;">Gene</div>
+                <div style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; box-sizing:border-box;">Phenotype Format</div>
+                <div style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; box-sizing:border-box;">What It Means</div>
+            </div>
+            {variant_body}
+        </div>
 
         {_h2("Understanding the DPYD Activity Score")}
         {_para("DPYD is the primary enzyme responsible for breaking down fluoropyrimidine drugs (capecitabine, fluorouracil, tegafur, flucytosine). Unlike other genes in this report, DPYD phenotype is expressed using an <strong>Activity Score (AS)</strong> system that reflects the combined functional impact of both gene copies.")}
-        <table style="width:100%; border-collapse:collapse; border:none; margin-bottom:10px;">
-            <thead>
-                <tr style="background:#4DB7D0;">
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:center; color:white; width:15%; border:1px solid #4DB7D0;">Activity Score</th>
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; width:35%; border:1px solid #4DB7D0;">Phenotype</th>
-                    <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; border:1px solid #4DB7D0;">Clinical Implication</th>
-                </tr>
-            </thead>
-            <tbody>{dpyd_body}</tbody>
-        </table>
+        <div class="intro-safe-grid" style="margin-bottom:10px;">
+            <div class="intro-safe-grid-header" style="display:grid; grid-template-columns:15% 35% 50%; background:#4DB7D0;">
+                <div style="padding:4px 6px; font-size:12px; font-weight:700; text-align:center; color:white;">Activity Score</div><div style="padding:4px 6px; font-size:12px; font-weight:700; color:white;">Phenotype</div><div style="padding:4px 6px; font-size:12px; font-weight:700; color:white;">Clinical Implication</div>
+            </div>{dpyd_body}
+        </div>
 
         {_h2("DPYD Diplotype Notation")}
         {_para("Unlike most genes in this report, which use <strong>star allele notation</strong> (e.g., *1/*5, *1/*9), DPYD diplotypes are reported in <strong>cDNA nucleotide notation</strong> (e.g., c.1057C>T/c.1484A>G). This is the established international convention for DPYD because the gene's variant landscape does not lend itself to the star allele system.")}
@@ -1027,8 +2863,9 @@ def faqs_template(name, pg):
     </div>
     """
 
-    page_content3 = f"""
-    <div style="padding-top: 10px;">
+    page_content4 = f"""
+    <div style="padding-top:10px;">
+        {_continued_title()}
         <div style="page-break-inside: avoid; break-inside: avoid; margin-bottom: 12px;">
             {_h2("Understanding the PRODRUG Label")}
             {_para("Some drugs in this report are labeled <strong>PRODRUG</strong>. This label is clinically relevant for pharmacogenomics because the relationship between a metabolizer phenotype and clinical outcome differs:")}
@@ -1047,7 +2884,15 @@ def faqs_template(name, pg):
         <div style="page-break-inside: avoid; break-inside: avoid; margin-bottom: 12px;">
             {_h2("What If a Gene Shows More Than One Diplotype or Phenotype?")}
             {_para("For some genes (such as SLCO1B1, NAT2, CYP4F2), your report may show multiple possible diplotypes in a single row. This happens when the analysis cannot definitively phase your variants &mdash; that is, it can identify the variants you carry but cannot always determine with certainty which variants sit on the same chromosome copy. Rather than exclude ambiguous results, the report shows all clinically plausible diplotype-phenotype combinations so your clinician has the full picture.")}
-            {_para("For <strong>CYP4F2 and warfarin specifically:</strong> When two possible diplotypes are shown (e.g., *1/*5 or *1/*23), both generally suggest slightly higher warfarin dose requirements. The clinical impact difference between them is modest. However, the full warfarin dosing picture requires CYP2C9 genotype data, which may not be available from this dataset &mdash; see the Note to Doctor section for details.")}
+            {_para(
+                "For <strong>CYP4F2 and warfarin specifically:</strong> "
+                "When more than one plausible diplotype is shown, the "
+                "possible interpretations may have similar or overlapping "
+                "clinical implications. Warfarin dosing should not be "
+                "interpreted from CYP4F2 alone; CYP2C9, VKORC1, available "
+                "clinical factors, and the completeness of the submitted "
+                "genetic data should all be considered together."
+            )}
         </div>
 
         <div style="page-break-inside: avoid; break-inside: avoid; margin-bottom: 12px;">
@@ -1058,21 +2903,18 @@ def faqs_template(name, pg):
         <div style="page-break-inside: avoid; break-inside: avoid; margin-bottom: 12px;">
             {_h2("How to Read the Clinical Recommendations")}
             {_para("Each drug section ends with a Clinical Recommendations block, sourced from CPIC, DPWG, ClinPGx, or the FDA. Here is how to read them:")}
-            <table style="width:100%; border-collapse:collapse; border:none; margin-bottom:8px;">
-                <thead>
-                    <tr style="background:#4DB7D0;">
-                        <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; width:28%; border:1px solid #4DB7D0;">Recommendation Type</th>
-                        <th style="padding:4px 6px; font-size:12px; font-weight:700; text-align:left; color:white; border:1px solid #4DB7D0;">What It Means in Practice</th>
-                    </tr>
-                </thead>
-                <tbody>{rec_body}</tbody>
-            </table>
+            <div class="intro-safe-grid" style="margin-bottom:8px;">
+                <div class="intro-safe-grid-header" style="display:grid; grid-template-columns:28% 72%; background:#4DB7D0;">
+                    <div style="padding:4px 6px; font-size:12px; font-weight:700; color:white;">Recommendation Type</div><div style="padding:4px 6px; font-size:12px; font-weight:700; color:white;">What It Means in Practice</div>
+                </div>{rec_body}
+            </div>
         </div>
     </div>
     """
 
-    page_content4 = f"""
-    <div style="padding-top: 10px;">
+    page_content5 = f"""
+    <div style="padding-top:10px;">
+        {_continued_title()}
         {_h2("What Is the 'Other Evaluated Medications' Section?")}
         {_para("This section lists drugs that were assessed as part of the analysis, but for which there is no recognized guideline-level clinical recommendation. These are included because:")}
         <ul style="font-size:11.5px; color:#374151; line-height:1.6; margin-top:4px; margin-bottom:8px; padding-left:18px;">
@@ -1099,12 +2941,24 @@ def faqs_template(name, pg):
     </div>
     """
 
-    pg1 = _wrap_page(page_content1, name, pg, page_id="faqs")
-    pg2 = _wrap_page(page_content2, name, pg + 1)
-    pg3 = _wrap_page(page_content3, name, pg + 2)
-    pg4 = _wrap_page(page_content4, name, pg + 3)
+    combined_content = (
+        page_content1
+        + page_content2
+        + page_content3
+        + page_content4
+        + page_content5
+    )
 
-    return [pg1, pg2, pg3, pg4], pg + 4
+    page = _wrap_page(
+        combined_content,
+        name,
+        pg,
+        page_id="faqs",
+        background_color="#f3f4f6"
+    )
+
+    return [page], pg + 1
+
 # ============================================================================
 # 4. FOR YOUR DOCTOR PAGE
 # ============================================================================
@@ -1184,37 +3038,17 @@ def doctor_page_template(df, master_genes_df, name, pg):
         <div style="font-size:11.5px; line-height:1.6; color:#374151; margin-bottom:8px;">
             <p style="margin-bottom:4px;">A patient\'s genetically predicted phenotype may not reflect their actual functional phenotype if they are concurrently taking medications that inhibit or induce the same enzyme. <strong>Example:</strong> A patient who is a genotypic Normal Metabolizer for CYP2D6 may function as a Poor Metabolizer if they are also taking a strong CYP2D6 inhibitor such as fluoxetine, paroxetine, or bupropion.</p>
             <p style="margin-bottom:4px;">Clinicians should always cross-check the patient\'s medication list for known inhibitors and inducers of any gene flagged in this report. Common phenoconverting agents include:</p>
-            <table style="width:100%; border-collapse:collapse; border:none; margin-bottom:8px;">
-                <thead>
-                    <tr style="background:#4DB7D0;">
-                        <th style="padding:4px 6px; font-size:11px; font-weight:700; text-align:left; color:white; width:15%; border:1px solid #4DB7D0;">Gene</th>
-                        <th style="padding:4px 6px; font-size:11px; font-weight:700; text-align:left; color:white; width:45%; border:1px solid #4DB7D0;">Common Strong Inhibitors (may convert to Poor Metabolizer)</th>
-                        <th style="padding:4px 6px; font-size:11px; font-weight:700; text-align:left; color:white; width:40%; border:1px solid #4DB7D0;">Common Inducers (may increase metabolism)</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr style="background:#f9fafb;">
-                        <td style="padding:4px 6px; font-size:11px; font-weight:600; border:1px solid #e5e7eb;">CYP2D6</td>
-                        <td style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">Fluoxetine, paroxetine, bupropion, terbinafine, quinidine</td>
-                        <td style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">None</td>
-                    </tr>
-                    <tr style="background:#ffffff;">
-                        <td style="padding:4px 6px; font-size:11px; font-weight:600; border:1px solid #e5e7eb;">CYP2C19</td>
-                        <td style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">Fluvoxamine, fluconazole, ticlopidine</td>
-                        <td style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">Rifampin, carbamazepine</td>
-                    </tr>
-                    <tr style="background:#f9fafb;">
-                        <td style="padding:4px 6px; font-size:11px; font-weight:600; border:1px solid #e5e7eb;">CYP3A4/5</td>
-                        <td style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">Ketoconazole, itraconazole, clarithromycin, grapefruit juice</td>
-                        <td style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">Rifampin, carbamazepine, phenytoin, St. John's wort</td>
-                    </tr>
-                    <tr style="background:#ffffff;">
-                        <td style="padding:4px 6px; font-size:11px; font-weight:600; border:1px solid #e5e7eb;">CYP2C9</td>
-                        <td style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">Fluconazole, amiodarone, miconazole</td>
-                        <td style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">Rifampin</td>
-                    </tr>
-                </tbody>
-            </table>
+            <div class="intro-safe-grid" style="margin-bottom:8px;">
+                <div class="intro-safe-grid-header" style="display:grid; grid-template-columns:15% 45% 40%; background:#4DB7D0;">
+                    <div style="padding:4px 6px; font-size:11px; font-weight:700; color:white;">Gene</div>
+                    <div style="padding:4px 6px; font-size:11px; font-weight:700; color:white;">Common Strong Inhibitors (may convert to Poor Metabolizer)</div>
+                    <div style="padding:4px 6px; font-size:11px; font-weight:700; color:white;">Common Inducers (may increase metabolism)</div>
+                </div>
+                <div class="intro-safe-row" style="display:grid; grid-template-columns:15% 45% 40%; background:#f9fafb;"><div style="padding:4px 6px; font-size:11px; font-weight:600; border:1px solid #e5e7eb;">CYP2D6</div><div style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">Fluoxetine, paroxetine, bupropion, terbinafine, quinidine</div><div style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">None</div></div>
+                <div class="intro-safe-row" style="display:grid; grid-template-columns:15% 45% 40%; background:#ffffff;"><div style="padding:4px 6px; font-size:11px; font-weight:600; border:1px solid #e5e7eb;">CYP2C19</div><div style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">Fluvoxamine, fluconazole, ticlopidine</div><div style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">Rifampin, carbamazepine</div></div>
+                <div class="intro-safe-row" style="display:grid; grid-template-columns:15% 45% 40%; background:#f9fafb;"><div style="padding:4px 6px; font-size:11px; font-weight:600; border:1px solid #e5e7eb;">CYP3A4/5</div><div style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">Ketoconazole, itraconazole, clarithromycin, grapefruit juice</div><div style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">Rifampin, carbamazepine, phenytoin, St. John's wort</div></div>
+                <div class="intro-safe-row" style="display:grid; grid-template-columns:15% 45% 40%; background:#ffffff;"><div style="padding:4px 6px; font-size:11px; font-weight:600; border:1px solid #e5e7eb;">CYP2C9</div><div style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">Fluconazole, amiodarone, miconazole</div><div style="padding:4px 6px; font-size:11px; border:1px solid #e5e7eb;">Rifampin</div></div>
+            </div>
             <p style="margin-bottom:4px;">This report does not perform phenoconversion analysis. That assessment must be performed by the prescribing clinician.</p>
         </div>
 
@@ -1227,7 +3061,7 @@ def doctor_page_template(df, master_genes_df, name, pg):
     </div>
     """
 
-    pg1 = _wrap_page(page_content1, name, pg, page_id="doctor")
+    pg1 = _wrap_page(page_content1, name, pg, page_id="doctor", background_color="#f3f4f6")
     
     return [pg1], pg + 1
 # # ============================================================================
@@ -1928,7 +3762,7 @@ def toc_template(tocitems, name: str, pg: int) -> str:
                     <a href="#{anchor}" style="color:#1a1a1a; text-decoration:none;">{display_label}</a>
                 </td>
                 <td style="padding:5px 8px; font-size:12px; color:#374151; font-weight:700; text-align:right; width:55px; white-space:nowrap;">
-                    {pagenum or ''}
+                    <a href="#{anchor}" class="toc-page-number" aria-label="Page for {display_label}"></a>
                 </td>
             </tr>
             """
@@ -1947,7 +3781,7 @@ def toc_template(tocitems, name: str, pg: int) -> str:
                     <a href="#{anchor}" style="color:#1a1a1a; text-decoration:none;">{display}</a>
                 </td>
                 <td style="padding:6px 8px; font-size:11.5px; color:#374151; font-weight:700; text-align:right; width:55px; white-space:nowrap;">
-                    {pagenum or ''}
+                    <a href="#{anchor}" class="toc-page-number" aria-label="Page for {display}"></a>
                 </td>
             </tr>
             """
@@ -1970,7 +3804,138 @@ def toc_template(tocitems, name: str, pg: int) -> str:
         """
     return _wrap_page(inner, name, pg, page_id="tocpage")
 
-def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, is_section_start=False, coverage_categories=None, master_genes_df=None, drug_gene_map=None, drug_gene_catalog=None, rs12777823_in_step1: bool = False, per_drug_overrides=None):
+def drug_crosslisted_template(
+    drug_name,
+    category,
+    category_rows,
+    patient_name,
+    curr_pg,
+    primary_category,
+    primary_anchor,
+    primary_rows=None,
+    as_fragment=False,
+):
+    """Render a compact secondary occurrence for a cross-listed drug.
+
+    The full pharmacogenomic monograph is rendered once under the first
+    therapeutic category.  Additional category blocks are intended to sit
+    immediately below that monograph for the same drug, preserving category-
+    specific explanatory content while referring to the recommendation above.
+    """
+
+    def _safe(val):
+        text = str(val).strip()
+        return text if text.lower() not in {"", "nan", "none", "n/a"} else ""
+
+    def _unique_texts(df, column):
+        if df is None or df.empty or column not in df.columns:
+            return []
+        out = []
+        for value in df[column].tolist():
+            text = _safe(value)
+            if text and text not in out:
+                out.append(text)
+        return out
+
+    def _text_block(values):
+        if not values:
+            return '<div style="color:#6b7280; font-style:italic;">No description available.</div>'
+        return ''.join(
+            f'<div style="margin-bottom:{"7px" if i < len(values)-1 else "0"};">{text}</div>'
+            for i, text in enumerate(values)
+        )
+
+    drug_id = sanitize_id(drug_name) + "__" + sanitize_id(category)
+    fs_headers = "14px"
+    fs_subheaders = "12px"
+    fs_body = "11.5px"
+
+    class_box = f"""
+        <div class="crosslisted-category-heading" style="margin: 12px 0 10px 0; padding: 8px 14px; border-radius: 24px;
+                    border: 1px solid #c9dff0; background: linear-gradient(90deg, #eef5fc 0%, #e0effa 100%);
+                    text-align: center; font-size: {fs_headers}; font-weight: 700; color: #000000;
+                    text-transform: uppercase; letter-spacing: 0.5px;">
+            {category}
+        </div>
+    """
+
+    drug_title_box = f"""
+        <div class="drug-header"
+             style="background: linear-gradient(90deg, #0984b6 0%, #63c0d3 100%); padding: 7px 12px; margin-bottom: 8px;">
+            <h3 class="drug-title" style="font-size:{fs_subheaders}; font-weight:700; margin:0; color:#ffffff;">
+                <span style="text-transform:uppercase;">{drug_name[0]}</span>{drug_name[1:]}
+            </h3>
+        </div>
+    """
+
+    about_values = _unique_texts(category_rows, "About this medication")
+    about_block = f"""
+        <div class="info-box crosslisted-about-box" style="margin-bottom:10px; border:1px solid #d0e4f7; border-left:4px solid #4DB7D0;
+                    border-radius:8px; background:#f4f9ff; padding:9px 14px;">
+            <div style="font-size:{fs_headers}; font-weight:700; color:#1a1a1a; margin-bottom:4px;">About this medication</div>
+            <div style="font-size:{fs_body}; line-height:1.5; color:#333;">{_text_block(about_values)}</div>
+        </div>
+    """
+
+    # Every therapeutic-category occurrence should carry its own explanatory
+    # patient context when the GSI provides it.  Do NOT suppress this block just
+    # because the text happens to be identical to the primary category.
+    witm_col = "How this gene/phenotype affects the drug and what it means for you"
+    current_witm = _unique_texts(category_rows, witm_col)
+    impact_block = ""
+    if current_witm:
+        impact_block = f"""
+        <div class="info-box crosslisted-impact-box" style="margin-bottom:10px; border:1px solid #e5e7eb; border-left:4px solid #94a3b8;
+                    border-radius:8px; background:#ffffff; padding:9px 14px;">
+            <div style="font-size:{fs_headers}; font-weight:700; color:#1a1a1a; margin-bottom:4px;">What it means for you</div>
+            <div style="font-size:{fs_body}; line-height:1.5; color:#333;">{_text_block(current_witm)}</div>
+        </div>
+        """
+
+    # Compact patient finding from the already patient-matched Step 4 rows.
+    finding_pairs = []
+    if category_rows is not None and not category_rows.empty:
+        for row in category_rows.to_dict("records"):
+            gene = _safe(row.get("Gene", ""))
+            pheno = _safe(row.get("Phenotype", ""))
+            if not gene or not pheno:
+                continue
+            pheno = re.sub(r'\(as:([^)]+)\)', lambda m: f'(AS:{m.group(1)})', pheno, flags=re.IGNORECASE)
+            pair = f"<strong>{gene}</strong> — {pheno}"
+            if pair not in finding_pairs:
+                finding_pairs.append(pair)
+    finding_html = "; &nbsp; ".join(finding_pairs[:6])
+    if len(finding_pairs) > 6:
+        finding_html += "; …"
+
+    primary_label = str(primary_category).title()
+    cross_ref = f"""
+        <div style="margin-bottom:10px;">
+            <div style="font-size:{fs_headers}; font-weight:700; color:#1a1a1a; margin-bottom:5px;">Clinical Recommendations</div>
+            <div class="crosslisted-reference-box" style="padding:10px 14px; border:1px solid #bfdbfe; border-left:4px solid #2563eb;
+                        border-radius:6px; background:#eff6ff; font-size:{fs_body}; line-height:1.55; color:#1e3a5f;">
+                See the full pharmacogenomic recommendation above under
+                <strong>{primary_label} — {drug_name}</strong>.
+                {f'<div style="margin-top:7px; padding-top:7px; border-top:1px solid #dbeafe; color:#374151;"><strong>Key genetic finding:</strong> {finding_html}</div>' if finding_html else ''}
+            </div>
+        </div>
+    """
+
+    content = f"""
+    <div class="crosslisted-category-block" id="{drug_id}" style="padding-top:6px;">
+        {class_box}
+        {drug_title_box}
+        {about_block}
+        {impact_block}
+        {cross_ref}
+    </div>
+    """
+    if as_fragment:
+        return content
+    return _wrap_page(content, patient_name, curr_pg, page_id=drug_id)
+
+
+def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, is_section_start=False, coverage_categories=None, master_genes_df=None, drug_gene_map=None, drug_gene_catalog=None, rs12777823_in_step1: bool = False, per_drug_overrides=None, extra_category_blocks=None):
     # Note: "uncertain susceptibility" is a valid phenotype with recommendations from PharmCAT/GSI
     # (used for malignant hyperthermia genes), so it is NOT in the _BAD set
     _BAD = {"indeterminate", "no call", "no data available", "unknown", "no result", "nan", ""}
@@ -1978,6 +3943,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
     # platform (chip or pipeline never attempted it) — distinguished from
     # "indeterminate" which means the platform attempted it but couldn't call.
     _PLATFORM_LIMIT_PHENOS = {"no result", "no data available", "nan", ""}
+    _extra_category_html = "".join(extra_category_blocks or [])
 
     # RYR1 genotype check for clinical override
     ryr1_status = None
@@ -2247,7 +4213,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
         )
 
     drug_title_box = f"""
-        <div class="drug-header" id="{drug_id}" style="background: linear-gradient(90deg, #0984b6 0%, #63c0d3 100%); padding: 7px 12px; margin-bottom: 6px;">
+        <div class="drug-header" style="background: linear-gradient(90deg, #0984b6 0%, #63c0d3 100%); padding: 7px 12px; margin-bottom: 6px;">
             <h3 class="drug-title" style="font-size: {fs_subheaders}; font-weight: 700; margin: 0; color: #ffffff;"><span style="text-transform:uppercase;">{drug_name[0]}</span>{drug_name[1:]}{prodrug_badge}</h3>
         </div>
     """
@@ -2662,53 +4628,96 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
     # the Genes Analyzed table AND the Clinical Recommendations section to avoid
     # clutter and confusion — they're mentioned here instead.
     # Includes rs12777823 for warfarin when found in the patient's step1 VCF.
+
     _catalog_extra_html = ""
+
     # Yellow box should only show genes that are NOT already in the main Genes Analyzed table
     # (genes_catalog_only but not in genes_to_evaluate)
     _genes_for_yellow_box = genes_catalog_only - set(genes_to_evaluate)
 
     if _genes_for_yellow_box:
         _sorted_genes = sorted(_genes_for_yellow_box)
-        # Format genes with proper English list formatting (commas + "and" before last)
+
+        # Format genes with proper English list formatting
         if len(_sorted_genes) == 1:
             _genes_str = f'<strong style="color:#92400e;">{_sorted_genes[0]}</strong>'
+
         elif len(_sorted_genes) == 2:
-            _genes_str = f'<strong style="color:#92400e;">{_sorted_genes[0]}</strong> and <strong style="color:#92400e;">{_sorted_genes[1]}</strong>'
+            _genes_str = (
+                f'<strong style="color:#92400e;">{_sorted_genes[0]}</strong> and '
+                f'<strong style="color:#92400e;">{_sorted_genes[1]}</strong>'
+            )
+
         else:
             # 3+ genes: comma-separated with "and" before last
-            _gene_parts = [f'<strong style="color:#92400e;">{g}</strong>' for g in _sorted_genes[:-1]]
-            _genes_str = ', '.join(_gene_parts) + f' and <strong style="color:#92400e;">{_sorted_genes[-1]}</strong>'
+            _gene_parts = [
+                f'<strong style="color:#92400e;">{g}</strong>'
+                for g in _sorted_genes[:-1]
+            ]
+
+            _genes_str = (
+                ', '.join(_gene_parts)
+                + f' and <strong style="color:#92400e;">{_sorted_genes[-1]}</strong>'
+            )
 
         # Single line statement combining all genes
         _is_plural = len(_sorted_genes) > 1
         _verb = 'are' if _is_plural else 'is'
+
         _genes_html = (
-            f'<div style="margin-bottom:0px; margin-left:0px; font-size:11.5px; line-height:1.6;">'
-            f'{_genes_str} {_verb} known to affect this drug\'s metabolism (GSI catalog), but '
-            f'was not analyzed by PharmCAT in this report.'
+            f'<div style="margin-bottom:0px; margin-left:0px; '
+            f'font-size:11.5px; line-height:1.6;">'
+            f'{_genes_str} {_verb} known to affect this drug\'s metabolism '
+            f'(GSI catalog), but was not analyzed by PharmCAT in this report.'
             f'</div>'
         )
+
         _catalog_extra_html = (
-            f'<div style="margin-top:2px; margin-bottom:8px; padding:6px 12px; '
-            f'background:#fffbeb; border:1.5px solid #f59e0b; border-left:4px solid #d97706; '
-            f'border-radius:6px; font-size:11.5px; color:#78350f; line-height:1.5;">'
+            f'<div style="margin-top:0; margin-bottom:10px; padding:6px 12px; '
+            f'background:#fffbeb; border:1.5px solid #f59e0b; '
+            f'border-left:4px solid #d97706; border-radius:6px; '
+            f'font-size:11.5px; color:#78350f; line-height:1.5;">'
             f'<strong style="color:#92400e;">Other Associated Genes:</strong> '
             f'{_genes_html}'
             f'</div>'
         )
 
+
+    # ── FDA DDI compounding alert ─────────────────────────────────────────────
+    # IMPORTANT: this is OUTSIDE the "if _genes_for_yellow_box" block.
+    # Therefore it can appear whether or not Other Associated Genes exists.
+
+    _compounding_alert_html = generate_compounding_alert_html(
+        drug_name=drug_name,
+        gene_pheno_map=gene_pheno_map,
+        gene_status_map=gene_status_map,
+        fs_header=fs_headers,
+        fs_body=fs_body,
+    )
+
+
     genes_block = (
-        f'<div style="font-size:{fs_headers}; font-weight:700; color:#1a1a1a; margin:4px 0 3px 0;">Genes Analyzed</div>'
-        f'<table style="margin-bottom:2px; border:1px solid #dde2ea; width:100%;">'
+        f'<div style="font-size:{fs_headers}; font-weight:700; '
+        f'color:#1a1a1a; margin:4px 0 3px 0;">Genes Analyzed</div>'
+
+        f'<table style="margin-bottom:10px; border:1px solid #dde2ea; width:100%;">'
+
         f'<thead><tr>'
         f'<th style="width:15%; font-size:12px;">Gene</th>'
         f'<th style="width:30%; font-size:12px;">Diplotype</th>'
         f'<th style="width:35%; font-size:12px;">Phenotype</th>'
         f'<th style="width:20%; font-size:12px;">Status</th>'
         f'</tr></thead>'
+
         f'<tbody>{gene_rows_html}</tbody>'
+
         f'</table>'
+
+        # First: Other Associated Genes, if applicable
         f'{_catalog_extra_html}'
+
+        # Second: DDI block, if applicable
+        f'{_compounding_alert_html}'
     )
 
     # --- 2. ABOUT THIS MEDICATION ---
@@ -2719,7 +4728,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
     about = about or 'No description available.'
 
     about_block = (
-        f'<div class="info-box" style="margin-bottom:6px; border: 1px solid #d0e4f7; border-left: 4px solid #4DB7D0; border-radius: 8px; background: #f4f9ff; padding: 8px 14px;">'
+        f'<div class="info-box" style="margin-bottom:10px; border: 1px solid #d0e4f7; border-left: 4px solid #4DB7D0; border-radius: 8px; background: #f4f9ff; padding: 8px 14px;">'
         f'<div style="font-size:{fs_headers}; font-weight:700; color:#1a1a1a; margin-bottom:3px;">About this medication</div>'
         f'<div style="font-size:{fs_body}; line-height:1.5; color:#333;">{about}</div>'
         f'</div>'
@@ -2863,7 +4872,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
         unphased_note_global = f'<div style="font-size:11.5px; color:#c2410c; font-style:italic; margin-bottom:8px;">&#9888; Phasing was not performed for one or more genes. Multiple possible interpretations are provided below.</div>'
 
     impact_block = (
-        f'<div class="info-box" style="margin-bottom:6px; border: 1px solid #d0e4f7; border-left: 4px solid #4DB7D0; border-radius: 8px; background: #f4f9ff; padding: 8px 14px; page-break-inside: auto; break-inside: auto;">'
+        f'<div class="info-box" style="margin-bottom:10px; border: 1px solid #d0e4f7; border-left: 4px solid #4DB7D0; border-radius: 8px; background: #f4f9ff; padding: 8px 14px; page-break-inside: auto; break-inside: auto;">'
         f'<div style="font-size:{fs_headers}; font-weight:700; color:#1a1a1a; margin-bottom:6px;">What it means for you</div>'
         f'{unphased_note_global}'
         f'{impact_sections_html}'
@@ -3161,19 +5170,21 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
                 'status':  '',
             })
 
-    # Pagination: page 1 gets up to 2 recs (Genes/About/WITM blocks already
-    # consume most of page 1); continuation pages get up to 4 recs each.
-    # Bumped from 1+3 → 2+4 after card padding was tightened, so multi-gene
-    # drug pages (Atorvastatin/Fluvastatin) usually fit on a single page.
-    pages_html  = []
-    rec_chunks  = []
-    if len(all_recs) > 3:
-        rec_chunks.append(all_recs[:3])
-        remaining = all_recs[3:]
-        for i in range(0, len(remaining), 4):
-            rec_chunks.append(remaining[i:i + 4])
-    elif len(all_recs) >= 1:
-        rec_chunks.append(all_recs)
+# ================================================================
+# DYNAMIC DRUG-PAGE PAGINATION
+#
+# Keep all recommendations inside one logical drug section.
+# Chromium decides the physical page breaks from the ACTUAL
+# rendered height instead of recommendation count.
+# ================================================================
+
+    pages_html = []
+
+    rec_chunks = (
+        [all_recs]
+        if all_recs
+        else []
+    )
 
     def _links(raw: str) -> str:
         return ' '.join(
@@ -3279,7 +5290,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
             </div>
         </div>
         """
-        content = f"""<div style="padding-top: 10px;">{header_html}{class_box}{drug_title_box}{genes_block}{source_status_bar}{about_block}{impact_block}{fallback_rec}{links_html}</div>"""
+        content = f"""<div style="padding-top: 10px;">{header_html}{class_box}{drug_title_box}{genes_block}{source_status_bar}{about_block}{impact_block}{fallback_rec}{links_html}{_extra_category_html}</div>"""
         pages_html.append(_wrap_page(content, patient_name, curr_pg, page_id=drug_id))
         curr_pg += 1
     else:
@@ -3303,7 +5314,10 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
                             if idx < len(data['items']) - 1 else "padding-bottom: 4px;"
                         )
                         # Skip duplicate item text to avoid repeated paragraphs
-                        _item_key = '||'.join([str(item.get(k, '')).strip() for k in ('rec', 'impl', 'other')])
+                        # Phenotype/context is part of the identity.  Two patient-compatible
+                        # phenotypes can legitimately share identical CPIC text; do not hide one
+                        # merely because the recommendation wording is the same.
+                        _item_key = '||'.join([str(item.get(k, '')).strip() for k in ('context', 'rec', 'impl', 'other')])
                         if not hasattr(grouped_chunk[src], '_seen_texts'):
                             grouped_chunk[src]['_seen_texts'] = set()
                         if _item_key in grouped_chunk[src]['_seen_texts']:
@@ -3349,7 +5363,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
                                 rec_html   = f"<div style='background-color:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:8px 10px; font-size:12px; color:#0f172a; margin-bottom:8px; line-height:1.5;'><strong style='color:#0f172a;'>Recommendation:</strong> {_formatted_rec}</div>" if _formatted_rec else ""
                                 other_html = f"<div style='font-size:11.5px; color:#6b7280; line-height:1.4;'><strong style='color:#4b5563;'>Other Considerations:</strong> {item['other']}</div>" if item['other'] else ""
                         items_html += f"""
-                        <div style="{b_bottom}">
+                        <div class="recommendation-entry" style="{b_bottom} page-break-inside:avoid; break-inside:avoid;">
                             {ctx_html}{impl_html}{rec_html}{other_html}
                         </div>
                         """
@@ -3364,7 +5378,7 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
                     # the browser pushes it to the next page.
                     g_html += f"""
                     <div style="margin-bottom:4px; padding:6px 12px 1px 12px; border-left:4px solid {style['text']}; border-radius:6px; background:#ffffff; box-shadow: 0 1px 2px rgba(0,0,0,0.04); border-top:1px solid #f3f4f6; border-right:1px solid #f3f4f6; border-bottom:1px solid #f3f4f6;">
-                        <div style="margin-bottom:4px;">
+                        <div class="recommendation-source-label" style="margin-bottom:4px; page-break-after:avoid; break-after:avoid;">
                             <span style="background-color:{style['bg']}; color:{style['text']}; border:1px solid {style['border']}; padding:2px 6px; border-radius:12px; font-size:12px; font-weight:700; letter-spacing:0.3px; text-transform:uppercase;">{src}</span>
                         </div>
                         {items_html}
@@ -3396,174 +5410,855 @@ def drug_detail_template(drug_name, category, drug_rows, patient_name, curr_pg, 
                 """
 
                 if i == 0:
-                    content = f"""<div style="padding-top: 8px;">{header_html}{class_box}{drug_title_box}{genes_block}{source_status_bar}{about_block}{impact_block}{guidelines_block}{links_html if len(rec_chunks) == 1 else ""}</div>"""
+                    content = f"""<div style="padding-top: 8px;">{header_html}{class_box}{drug_title_box}{genes_block}{source_status_bar}{about_block}{impact_block}{guidelines_block}{links_html if len(rec_chunks) == 1 else ""}{_extra_category_html if len(rec_chunks) == 1 else ""}</div>"""
                     pages_html.append(_wrap_page(content, patient_name, curr_pg, page_id=drug_id))
                 else:
                     cont_title_box = f"""<div class="drug-header" id="{drug_id}_cont_{i}" style="background: linear-gradient(90deg, #0984b6 0%, #63c0d3 100%); padding: 7px 12px; border-radius: 12px; margin-bottom: 6px;"><h3 class="drug-title" style="font-size: {fs_subheaders}; font-weight: 700; margin: 0; color: #ffffff; display:inline-block;"><span style="text-transform:uppercase;">{drug_name[0]}</span>{drug_name[1:]} (Continued)</h3></div>"""
-                    content = f"""<div style="padding-top: 8px;">{cont_title_box}{guidelines_block}{links_html if i == len(rec_chunks) - 1 else ""}</div>"""
+                    content = f"""<div style="padding-top: 8px;">{cont_title_box}{guidelines_block}{links_html if i == len(rec_chunks) - 1 else ""}{_extra_category_html if i == len(rec_chunks) - 1 else ""}</div>"""
                     pages_html.append(_wrap_page(content, patient_name, curr_pg, page_id=f"{drug_id}_{i}"))
                 curr_pg += 1
         return pages_html, curr_pg
 
 
-def other_evaluated_medicines_template(df, name, pg, master_genes_df, drug_gene_map):
+def other_evaluated_medicines_template(
+    df,
+    name,
+    pg,
+    master_genes_df,
+    drug_gene_map
+):
+    """
+    Other Evaluated Medications
+
+    Groups medications by:
+
+        Gene + patient's genetic result
+
+    instead of showing one table row per medication.
+
+    Important:
+    A medication associated with more than one gene can appear in
+    more than one gene card. This is intentional because each
+    gene-drug relationship was evaluated separately.
+    """
+
+    # ========================================================================
+    # Helpers
+    # ========================================================================
+
     def _safe(val):
         s = str(val).strip()
-        return s if s.lower() not in ('', 'nan', 'none', 'n/a') else ''
-        
-    unique_drugs = sorted(df["Drug Name"].unique())
-    drug_data_list = []
-    
-    for drug in unique_drugs:
-        drug_rows = df[df["Drug Name"] == drug]
-        drug_key = str(drug).strip().lower()
-        
-        genes_from_map = set(drug_gene_map.get(drug_key, [])) if drug_gene_map else set()
-        genes_from_rows = set()
-        for row in drug_rows.to_dict("records"):
-            raw_g = _safe(row.get('Gene',''))
-            for sep in [';', '\n', ',']:
-                if sep in raw_g:
-                    genes_from_rows.update([x.strip() for x in raw_g.split(sep) if x.strip()])
-                    break
-            else:
-                if raw_g: genes_from_rows.add(raw_g)
-                
-        genes_to_evaluate = sorted(list(genes_from_map | genes_from_rows))
-        
-        gene_list = []
-        for g in genes_to_evaluate:
-            if not g: continue
-            if master_genes_df is not None and not master_genes_df.empty:
-                match = master_genes_df[master_genes_df['Gene'].str.lower() == g.lower()]
-                if not match.empty:
-                    gene_phenos = {}
-                    for m_row in match.to_dict("records"):
-                        raw_d = _safe(m_row.get('Diplotype', '-'))
-                        raw_p = _safe(m_row.get('Phenotype', 'No data available'))
-                        
-                        if ":" in raw_p and raw_p.lower().startswith(g.lower()): 
-                            raw_p = raw_p.split(":", 1)[1].strip()
-                        if raw_p.lower() in ["no result", "not called", "unknown/unknown", "unknown", "unassigned", "n/a", "", "nan", "uncategorized"]:
-                            raw_p = "No data available"
-                        
-                        if raw_p not in gene_phenos:
-                            gene_phenos[raw_p] = []
-                        if raw_d and raw_d not in gene_phenos[raw_p] and raw_d != "-":
-                            gene_phenos[raw_p].append(raw_d)
-                    
-                    if len(gene_phenos) > 1 and "No data available" in gene_phenos:
-                        del gene_phenos["No data available"]
-                        
-                    for p_str, d_vals in gene_phenos.items():
-                        d_str = ", ".join(d_vals) if d_vals else "-"
-                        if ',' in d_str: d_str = d_str.split(',')[0].strip()
-                        gene_list.append({'g': g, 'd': d_str, 'p': p_str})
-                else:
-                    gene_list.append({'g': g, 'd': '-', 'p': 'No data available'})
-            else:
-                gene_list.append({'g': g, 'd': '-', 'p': 'No data available'})
-                
-        drug_data_list.append({'drug': drug, 'genes': gene_list})
 
-    # Calculate row heights dynamically to estimate page count
-    heights = []
-    for item in drug_data_list:
-        num_genes = len(item['genes']) if item['genes'] else 1
-        row_height = 36 + 20 * (num_genes - 1)
-        heights.append(row_height)
+        return (
+            s
+            if s.lower() not in (
+                '',
+                'nan',
+                'none',
+                'n/a'
+            )
+            else ''
+        )
 
-    estimated_pages = max(1, sum(heights) // 860 + 1)
 
-    pages = []
-    curr_pg = pg
-    total_items = len(drug_data_list)
-    
-    if total_items == 0:
-        content = f"""
-        <div style="padding-top: 10px;">
-            <div class="page-title" id="other_evaluated" style="margin-bottom: 24px;">Other Evaluated Medications</div>
-            <p style="font-size:11.5px; color:#555; line-height:1.5; margin-bottom:10px;">
-                These medications were evaluated using your genetic profile.
-                They are listed here because your available genetic data
-                was insufficient to generate personalised guidance, or no established
-                guideline covers this gene—drug combination.
-            </p>
-            <table style="margin:0; width:100%; border-collapse:collapse; border: none;">
-                <thead>
-                    <tr style="background:#023D79;">
-                        <th style="width:25%; color:white; padding:8px 10px; font-size:12px; text-align:left;">Medication</th>
-                        <th style="width:25%; color:white; padding:8px 10px; font-size:12px; text-align:left;">Gene(s)</th>
-                        <th style="width:50%; color:white; padding:8px 10px; font-size:12px; text-align:left;">Diplotype</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr><td colspan="3" style="padding:10px; text-align:center; font-size:12px; color:#6b7280;">No other evaluated medications.</td></tr>
-                </tbody>
-            </table>
+    def _is_unknown_result(value):
+        """
+        Return True when the phenotype/diplotype does not represent
+        a usable patient genetic result.
+        """
+
+        v = str(
+            value or ''
+        ).strip().lower()
+
+        return v in {
+            '',
+            'nan',
+            'none',
+            'n/a',
+            'unknown',
+            'unknown/unknown',
+            'unknown / unknown',
+            'no result',
+            'no data available',
+            'not called',
+            'unassigned',
+            'uncategorized',
+        }
+
+
+    # ========================================================================
+    # Empty OEM dataframe
+    # ========================================================================
+
+    if (
+        df is None
+        or df.empty
+        or "Drug Name" not in df.columns
+    ):
+
+        content = """
+        <div style="padding-top:10px;">
+
+            <div
+                class="page-title"
+                id="other_evaluated"
+                style="margin-bottom:14px;"
+            >
+                Other Evaluated Medications
+            </div>
+
+            <div style="
+                padding:14px;
+                border:1px solid #e5e7eb;
+                border-radius:6px;
+                background:#f9fafb;
+                text-align:center;
+                color:#6b7280;
+                font-size:11.5px;
+            ">
+                No other evaluated medications.
+            </div>
+
         </div>
         """
-        pages.append(_wrap_page(content, name, curr_pg, page_id="other_evaluated"))
-        curr_pg += 1
-        return pages, curr_pg
 
-    rows_html = ""
-    for item in drug_data_list:
-        drug_name  = str(item['drug']).title()
-        genes      = item['genes']
+        return (
+            [
+                _wrap_page(
+                    content,
+                    name,
+                    pg,
+                    page_id="other_evaluated"
+                )
+            ],
+            pg + 1
+        )
 
-        if not genes:
-            rows_html += (
-                f'<tr>'
-                f'<td style="font-weight:700; color:#111827; vertical-align:top; border-bottom:1px solid #f3f4f6; padding:8px 10px;">{drug_name}</td>'
-                f'<td style="vertical-align:top; border-bottom:1px solid #f3f4f6; padding:8px 10px;">-</td>'
-                f'<td style="vertical-align:top; border-bottom:1px solid #f3f4f6; padding:8px 10px;">-</td>'
-                f'</tr>'
+
+    # ========================================================================
+    # STEP 1
+    #
+    # Build one patient-result record per gene from master_genes_df.
+    #
+    # Example:
+    #
+    # CYP2C9 ->
+    #     diplotype = *1/*11
+    #     phenotype = Intermediate Metabolizer
+    #
+    # CYP2D6 ->
+    #     diplotype = Unknown/Unknown
+    #     phenotype = No data available
+    # ========================================================================
+
+    gene_result_map = {}
+
+
+    if (
+        master_genes_df is not None
+        and not master_genes_df.empty
+        and "Gene" in master_genes_df.columns
+    ):
+
+        master_df = (
+            master_genes_df.copy()
+        )
+
+        master_df["Gene"] = (
+            master_df["Gene"]
+            .astype(str)
+            .str.strip()
+        )
+
+
+        for gene in (
+            master_df["Gene"]
+            .dropna()
+            .unique()
+        ):
+
+            gene = str(
+                gene
+            ).strip()
+
+            if not gene:
+                continue
+
+
+            matches = master_df[
+                master_df["Gene"]
+                .str.lower()
+                == gene.lower()
+            ]
+
+
+            diplotypes = []
+            phenotypes = []
+
+
+            for row in (
+                matches
+                .to_dict("records")
+            ):
+
+                raw_d = _safe(
+                    row.get(
+                        "Diplotype",
+                        ""
+                    )
+                )
+
+                raw_p = _safe(
+                    row.get(
+                        "Phenotype",
+                        ""
+                    )
+                )
+
+
+                # Some master files contain:
+                #
+                # CYP2C9: Intermediate Metabolizer
+                #
+                # Strip the gene prefix.
+                if (
+                    ":"
+                    in raw_p
+                    and raw_p.lower().startswith(
+                        gene.lower()
+                    )
+                ):
+
+                    raw_p = (
+                        raw_p
+                        .split(
+                            ":",
+                            1
+                        )[1]
+                        .strip()
+                    )
+
+
+                if (
+                    raw_d
+                    and raw_d
+                    not in diplotypes
+                ):
+                    diplotypes.append(
+                        raw_d
+                    )
+
+
+                if (
+                    raw_p
+                    and raw_p
+                    not in phenotypes
+                ):
+                    phenotypes.append(
+                        raw_p
+                    )
+
+
+            # ------------------------------------------------------------
+            # Remove "no result" phenotype if another usable phenotype
+            # exists for the same gene.
+            # ------------------------------------------------------------
+
+            usable_phenotypes = [
+                p
+                for p in phenotypes
+                if not _is_unknown_result(p)
+            ]
+
+
+            if usable_phenotypes:
+
+                phenotypes = (
+                    usable_phenotypes
+                )
+
+
+            # ------------------------------------------------------------
+            # Collapse multiple possible diplotypes / phenotypes.
+            #
+            # This prevents one uncertain gene from generating several
+            # duplicate OEM cards.
+            # ------------------------------------------------------------
+
+            if diplotypes:
+
+                diplotype_display = (
+                    " / ".join(
+                        diplotypes
+                    )
+                )
+
+            else:
+
+                diplotype_display = (
+                    "Unknown"
+                )
+
+
+            if phenotypes:
+
+                phenotype_display = (
+                    " / ".join(
+                        phenotypes
+                    )
+                )
+
+            else:
+
+                phenotype_display = (
+                    "No data available"
+                )
+
+
+            # ------------------------------------------------------------
+            # A gene is considered uncallable if we have no meaningful
+            # phenotype.
+            # ------------------------------------------------------------
+
+            is_uncallable = (
+                not usable_phenotypes
             )
-        else:
-            g_str = "<br>".join([f"<span style='font-weight:600;'>{x['g']}</span>" for x in genes])
-            d_str = "<div style='margin-bottom: 2px;'></div>".join([x['d'] for x in genes])
 
-            rows_html += f'''
-            <tr>
-                <td style="font-weight:700; color:#111827; vertical-align:top; border-bottom:1px solid #f3f4f6; padding:8px 10px;">{drug_name}</td>
-                <td style="color:#374151; vertical-align:top; border-bottom:1px solid #f3f4f6; padding:8px 10px;">{g_str}</td>
-                <td style="color:#4b5563; vertical-align:top; word-break:break-all; border-bottom:1px solid #f3f4f6; padding:8px 10px;">{d_str}</td>
-            </tr>
-            '''
-            
-    title_html = f"""
-    <div class="page-title" id="other_evaluated" style="margin-bottom: 24px;">Other Evaluated Medications</div>
-    <p style="font-size:11.5px; color:#555; line-height:1.5; margin-bottom:10px;">
-        These medications were evaluated using your genetic profile.
-        They are listed here because the available genetic data for this patient
-        was insufficient to generate personalised guidance, or no established
-        guideline covers this gene–drug combination.
-    </p>
-    """
-        
+
+            gene_result_map[
+                gene.upper()
+            ] = {
+
+                "gene":
+                    gene,
+
+                "diplotype":
+                    diplotype_display,
+
+                "phenotype":
+                    phenotype_display,
+
+                "is_uncallable":
+                    is_uncallable,
+            }
+
+
+    # ========================================================================
+    # STEP 2
+    #
+    # Determine which genes belong to each OEM drug.
+    #
+    # We preserve your CURRENT behavior:
+    #
+    #     genes from drug_gene_map
+    #       +
+    #     genes present directly in the OEM rows
+    #
+    # ========================================================================
+
+    grouped = {}
+
+
+    unique_drugs = sorted(
+        df["Drug Name"]
+        .dropna()
+        .astype(str)
+        .unique(),
+        key=lambda x: x.lower()
+    )
+
+
+    for drug in unique_drugs:
+
+        drug_name = (
+            str(drug)
+            .strip()
+        )
+
+        drug_key = (
+            drug_name.lower()
+        )
+
+
+        drug_rows = df[
+            df["Drug Name"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            == drug_key
+        ]
+
+
+        genes_for_drug = set()
+
+
+        # ------------------------------------------------------------
+        # Genes from your Step 3 / Step 5 drug-gene map
+        # ------------------------------------------------------------
+
+        if drug_gene_map:
+
+            for gene in (
+                drug_gene_map.get(
+                    drug_key,
+                    []
+                )
+            ):
+
+                gene = str(
+                    gene
+                ).strip()
+
+                if gene:
+
+                    genes_for_drug.add(
+                        gene
+                    )
+
+
+        # ------------------------------------------------------------
+        # Genes stored directly in OEM dataframe rows
+        # ------------------------------------------------------------
+
+        if "Gene" in drug_rows.columns:
+
+            for row in (
+                drug_rows
+                .to_dict("records")
+            ):
+
+                raw_gene = _safe(
+                    row.get(
+                        "Gene",
+                        ""
+                    )
+                )
+
+
+                if not raw_gene:
+                    continue
+
+
+                # Supports:
+                #
+                # CYP2C9
+                # CYP2C9; G6PD
+                # CYP2C9, G6PD
+                # CYP2C9\nG6PD
+
+                gene_parts = re.split(
+                    r'[;,\n]+',
+                    raw_gene
+                )
+
+
+                for gene in gene_parts:
+
+                    gene = (
+                        gene.strip()
+                    )
+
+                    if gene:
+
+                        genes_for_drug.add(
+                            gene
+                        )
+
+
+        # ------------------------------------------------------------
+        # Drug with no identifiable gene
+        # ------------------------------------------------------------
+
+        if not genes_for_drug:
+
+            genes_for_drug.add(
+                "Gene Not Available"
+            )
+
+
+        # ====================================================================
+        # STEP 3
+        #
+        # Add this medication underneath EACH relevant gene/result.
+        #
+        # Multi-gene drugs intentionally appear in multiple cards.
+        # ====================================================================
+
+        for gene in sorted(
+            genes_for_drug,
+            key=lambda x: x.upper()
+        ):
+
+            gene_upper = (
+                gene.upper()
+            )
+
+
+            result = (
+                gene_result_map.get(
+                    gene_upper
+                )
+            )
+
+
+            if result is None:
+
+                result = {
+
+                    "gene":
+                        gene,
+
+                    "diplotype":
+                        "Unknown",
+
+                    "phenotype":
+                        "No data available",
+
+                    "is_uncallable":
+                        True,
+                }
+
+
+            # ------------------------------------------------------------
+            # Gene + patient result is the grouping key.
+            # ------------------------------------------------------------
+
+            group_key = (
+
+                result["gene"].upper(),
+
+                result["diplotype"],
+
+                result["phenotype"],
+
+                result["is_uncallable"],
+            )
+
+
+            if group_key not in grouped:
+
+                grouped[
+                    group_key
+                ] = {
+
+                    "gene":
+                        result["gene"],
+
+                    "diplotype":
+                        result["diplotype"],
+
+                    "phenotype":
+                        result["phenotype"],
+
+                    "is_uncallable":
+                        result["is_uncallable"],
+
+                    "drugs":
+                        [],
+                }
+
+
+            display_drug = (
+                drug_name.title()
+            )
+
+
+            if (
+                display_drug
+                not in grouped[
+                    group_key
+                ]["drugs"]
+            ):
+
+                grouped[
+                    group_key
+                ]["drugs"].append(
+                    display_drug
+                )
+
+
+    # ========================================================================
+    # STEP 4
+    #
+    # Convert grouped data into cards.
+    #
+    # Larger medication groups appear first.
+    # ========================================================================
+
+    cards = list(
+        grouped.values()
+    )
+
+
+    cards.sort(
+        key=lambda card: (
+            -len(
+                card["drugs"]
+            ),
+            card["gene"].upper(),
+        )
+    )
+
+
+    # ========================================================================
+    # Card renderer
+    # ========================================================================
+
+    def _render_card(card):
+
+        gene = (
+            card["gene"]
+        )
+
+        diplotype = (
+            card["diplotype"]
+        )
+
+        phenotype = (
+            card["phenotype"]
+        )
+
+        medications = (
+            card["drugs"]
+        )
+
+
+        is_uncallable = (
+            card["is_uncallable"]
+        )
+
+
+        # ------------------------------------------------------------
+        # Header
+        # ------------------------------------------------------------
+
+        if is_uncallable:
+
+            # Example:
+            #
+            # CYP2D6 — Unknown / Unknown
+
+            header_text = (
+                f'{gene} — '
+                f'{diplotype}'
+            )
+
+
+            # Don't repeat:
+            #
+            # Unknown — No data available
+            #
+            # The explanatory note underneath is enough.
+
+            subtitle_html = (
+                '<div style="'
+                'font-size:10.5px; '
+                'font-style:italic; '
+                'color:#6b7280; '
+                'line-height:1.4; '
+                'margin-top:2px; '
+                'margin-bottom:5px;'
+                '">'
+                'This gene could not be confidently determined '
+                'from your uploaded raw DNA file.'
+                '</div>'
+            )
+
+
+            background = (
+                "#fff8e8"
+            )
+
+            border_color = (
+                "#d99a2b"
+            )
+
+            header_color = (
+                "#92400e"
+            )
+
+
+        else:
+
+            # Example:
+            #
+            # G6PD — B(reference)/B(reference) — Normal
+
+            header_text = (
+                f'{gene} — '
+                f'{diplotype}'
+            )
+
+
+            if (
+                phenotype
+                and not _is_unknown_result(
+                    phenotype
+                )
+            ):
+
+                header_text += (
+                    f' — {phenotype}'
+                )
+
+
+            subtitle_html = ""
+
+
+            background = (
+                "#eef6fc"
+            )
+
+            border_color = (
+                "#2f86bd"
+            )
+
+            header_color = (
+                "#023D79"
+            )
+
+
+        # Keep the compact visual design, but avoid handing Paged.js one giant
+        # inline fragment.  Split the comma-separated list into short blocks that
+        # can move together to the next page if needed, while preserving the
+        # exact same appearance in the PDF.
+        chunk_lists = _comma_safe_chunks(medications, max_chars=180)
+        flat_items = [item for chunk in chunk_lists for item in chunk]
+        meds_chunks = []
+        flat_index = 0
+
+        for chunk in chunk_lists:
+            chunk_html = []
+            for med in chunk:
+                flat_index += 1
+                suffix = ", " if flat_index < len(flat_items) else ""
+                chunk_html.append(
+                    f'<span class="pdf-qa-oem-medication oem-medication-item">'
+                    f'{html_lib.escape(str(med))}'
+                    f'</span>{suffix}'
+                )
+            meds_chunks.append(
+                '<div class="oem-medication-chunk">' + ''.join(chunk_html) + '</div>'
+            )
+
+        meds_text = ''.join(meds_chunks)
+
+        med_count = (
+            len(
+                medications
+            )
+        )
+
+
+        count_text = (
+            f'{med_count} medication'
+            f'{"s" if med_count != 1 else ""} affected'
+        )
+
+        return f"""
+        <div
+            class="oem-card"
+            style="
+                background:{background};
+                border-left:4px solid {border_color};
+                border-radius:5px;
+                padding:8px 12px 7px 12px;
+                margin-bottom:8px;
+            "
+        >
+
+            <div class="oem-card-head">
+
+                <div style="
+                    font-size:13px;
+                    font-weight:700;
+                    color:{header_color};
+                    line-height:1.3;
+                ">
+                    {header_text}
+                </div>
+
+                {subtitle_html}
+
+            </div>
+
+            <div class="oem-medication-list" style="
+                font-size:11.5px;
+                color:#1f2937;
+                line-height:1.4;
+                margin-top:4px;
+                margin-bottom:4px;
+            ">
+                {meds_text}
+            </div>
+
+            <div class="oem-card-count" style="
+                font-size:10.5px;
+                color:#6b7280;
+                font-weight:500;
+            ">
+                {count_text}
+            </div>
+
+        </div>
+        """
+
+    # ========================================================================
+    # STEP 5
+    #
+    # Let Chromium paginate using ACTUAL rendered card heights.
+    # No hard-coded page budgets or card counts.
+    # ========================================================================
+
+    cards_html = "\n".join(
+        _render_card(card)
+        for card in cards
+    )
+
     content = f"""
-    <div style="padding-top: 10px;">
-        {title_html}
-        <table style="margin:0; width:100%; border-collapse:collapse; border: none;">
-            <thead style="display: table-header-group;">
-                <tr style="background:#023D79;">
-                    <th style="width:25%; color:white; padding:8px 10px; font-size:12px; text-align:left;">Medication</th>
-                    <th style="width:25%; color:white; padding:8px 10px; font-size:12px; text-align:left;">Gene(s)</th>
-                    <th style="width:50%; color:white; padding:8px 10px; font-size:12px; text-align:left;">Diplotype</th>
-                </tr>
-            </thead>
-            <tbody>
-                {rows_html}
-            </tbody>
-        </table>
+    <div
+        class="flow-section"
+        style="padding-top:10px;"
+    >
+
+        <div
+            class="page-title"
+            id="other_evaluated"
+            style="margin-bottom:10px;"
+        >
+            Other Evaluated Medications
+        </div>
+
+        <p style="
+            font-size:11.5px;
+            color:#555;
+            line-height:1.5;
+            margin-bottom:14px;
+        ">
+            These medications were evaluated using your genetic
+            profile but do not have a patient-specific clinical
+            recommendation in this report. To make this section
+            easier to review, medications are grouped below by
+            the gene and genetic result involved in their evaluation.
+        </p>
+
+        {cards_html}
+
     </div>
     """
-    pages.append(_wrap_page(content, name, curr_pg, page_id="other_evaluated"))
-    curr_pg += estimated_pages
-        
-    return pages, curr_pg
 
+    return (
+        [
+            _wrap_page(
+                content,
+                name,
+                pg,
+                page_id="other_evaluated"
+            )
+        ],
+        pg + 1
+    )
 
 # ============================================================================
 # COMPLETE MEDICATION PANEL
@@ -3895,104 +6590,130 @@ def genotype_summary_template(df, name, pg, qc_df=None):
             if detail_parts:
                 per_gene[gene] = " · ".join(detail_parts)
 
-    items = []
-    heights = []
 
-    # 1. Genotype rows
+    # ========================================================================
+    # CONTINUOUS GENOTYPE SUMMARY - PAGINATION SAFE
+    #
+    # IMPORTANT: do not use one large native HTML <table> here. Paged.js can
+    # lose the first fragment of a <tr> at a physical page boundary.  That is
+    # exactly what caused the SLCO1B1 row to lose its gene label and opening
+    # diplotypes in a real report.
+    #
+    # Instead, every genotype entry is an independent block/grid row.  Rows
+    # that fit on a page are kept intact and move to the next physical page when
+    # needed.  The surrounding topic itself remains completely fluid and can
+    # span any number of pages for any provider/raw-DNA file.
+    # ========================================================================
+
+    genotype_rows_html = ""
     for g, d, p in valid_rows:
-        items.append(("geno", (g, d, p)))
-        char_len = len(str(d)) + len(str(p))
-        lines = 1 + (char_len // 50)
-        heights.append(20 + lines * 18)
-
-    # 2. QC block if present
-    if per_gene:
-        items.append(("qc_hdr", None))
-        heights.append(85)
-        for gene in sorted(per_gene):
-            items.append(("qc_row", (gene, per_gene[gene])))
-            msg_len = len(str(per_gene[gene]))
-            lines = 1 + (msg_len // 75)
-            heights.append(18 + lines * 14)
-
-    # Note height is 75px
-    estimated_pages = max(1, sum(heights) // 860 + 1)
-
-    pages = []
-    curr_pg = pg
-
-    title_html = '<div class="page-title" id="genotype_summary" style="margin-bottom: 24px;">Genotype Summary</div>'
-    page_id = "genotype_summary"
-
-    geno_table_html = ""
-    if valid_rows:
-        rows_html = ""
-        for g, d, p in valid_rows:
-            styled_p = style_phenotype(p)
-            rows_html += f'<tr><td style="font-weight:600; padding:8px 10px; border-bottom:1px solid #f3f4f6; color:#111827;">{g}</td><td style="padding:8px 10px; border-bottom:1px solid #f3f4f6; color:#374151; word-wrap:break-word;">{d}</td><td style="padding:8px 10px; border-bottom:1px solid #f3f4f6;">{styled_p}</td></tr>'
-
-        geno_table_html = f"""
-        <table style="margin:0; width:100%; border-collapse:collapse; border: none;">
-            <thead style="display: table-header-group;">
-                <tr>
-                    <th style="width:20%;">Gene</th>
-                    <th style="width:30%;">Diplotype(s)</th>
-                    <th style="width:50%;">Phenotype</th>
-                </tr>
-            </thead>
-            <tbody>
-                {rows_html}
-            </tbody>
-        </table>
+        styled_p = style_phenotype(p)
+        genotype_rows_html += f"""
+        <div class="genotype-grid-row">
+            <div class="genotype-grid-cell pdf-qa-genotype-gene"
+                 style="font-weight:600; color:#111827;">
+                {g}
+            </div>
+            <div class="genotype-grid-cell pdf-qa-genotype-diplotype"
+                 style="color:#374151;">
+                {d}
+            </div>
+            <div class="genotype-grid-cell pdf-qa-genotype-phenotype">
+                {styled_p}
+            </div>
+        </div>
         """
 
-    qc_block_html = ""
+    genotype_grid = f"""
+    <div class="genotype-grid" style="width:100%; margin:0;">
+        <div class="genotype-grid-header">
+            <div class="genotype-grid-cell" style="font-weight:700;">Gene</div>
+            <div class="genotype-grid-cell" style="font-weight:700;">Diplotype(s)</div>
+            <div class="genotype-grid-cell" style="font-weight:700;">Phenotype</div>
+        </div>
+        {genotype_rows_html}
+    </div>
+    """
+
+    analytical_html = ""
     if per_gene:
         qc_rows_html = ""
         for gene in sorted(per_gene):
             msg = per_gene[gene]
-            qc_rows_html += (
-                f'<tr style="border-bottom:1px solid #fde68a;">'
-                f'<td style="padding:5px 8px; font-weight:700; font-size:12px; color:#111827; white-space:nowrap;">{gene}</td>'
-                f'<td style="padding:5px 8px; font-size:12px; color:#374151; line-height:1.4;">{msg}</td>'
-                f'</tr>'
-            )
+            qc_rows_html += f"""
+            <div class="analytical-grid-row">
+                <div class="analytical-grid-cell"
+                     style="font-weight:700; font-size:12px; color:#111827;">
+                    {gene}
+                </div>
+                <div class="analytical-grid-cell"
+                     style="font-size:12px; color:#374151; line-height:1.4;">
+                    {msg}
+                </div>
+            </div>
+            """
 
-        qc_block_html = f"""
-        <div style="background:#fffbeb; border:1px solid #f59e0b; border-left:4px solid #f59e0b;
-                    border-radius:6px; padding:12px 16px; margin-top:16px;">
-            <div style="font-weight:700; font-size:12px; color:#111827; margin-bottom:6px;">
+        analytical_html = f"""
+        <div
+            id="genotype_analytical_notes"
+            class="analytical-notes-box"
+            style="
+                margin-top:12px;
+                background:#fffbeb;
+                border:1px solid #f59e0b;
+                border-left:4px solid #f59e0b;
+                border-radius:6px;
+                padding:10px 12px 8px 12px;
+            "
+        >
+            <div
+                class="analytical-notes-heading"
+                style="font-size:12px; font-weight:700; color:#92400e; margin-bottom:5px;"
+            >
                 Analytical Notes
             </div>
-            <div style="font-size:12px; color:#374151; line-height:1.5; margin-bottom:8px;">
-                The genes below produced specific analytical notes during diplotype calling
-                (uncalled variants, ambiguous matches, etc.).  These do not change the
-                recommendations above but may be relevant for clinical follow-up.
+
+            <div style="font-size:11.5px; color:#374151; line-height:1.5; margin-bottom:8px;">
+                The genes below produced specific analytical notes during diplotype
+                calling (uncalled variants, ambiguous matches, etc.). These do not
+                change the recommendations above but may be relevant for clinical
+                follow-up.
             </div>
-            <table style="width:100%; border-collapse:collapse;">
-                <thead style="display: table-header-group;">
-                    <tr style="background:#fef3c7;">
-                        <th style="padding:4px 8px; font-size:12px; text-align:left; width:18%; color:#ffffff;">Gene</th>
-                        <th style="padding:4px 8px; font-size:12px; text-align:left; color:#ffffff;">Note</th>
-                    </tr>
-                </thead>
-                <tbody>{qc_rows_html}</tbody>
-            </table>
+
+            <div class="analytical-grid" style="width:100%;">
+                <div class="analytical-grid-header">
+                    <div class="analytical-grid-cell" style="font-weight:700; font-size:12px;">Gene</div>
+                    <div class="analytical-grid-cell" style="font-weight:700; font-size:12px;">Note</div>
+                </div>
+                {qc_rows_html}
+            </div>
         </div>
         """
 
     content = f"""
-    <div style="padding-top: 10px;">
-        {title_html}
-        {geno_table_html}
-        {qc_block_html}
+    <div class="flow-section genotype-summary-section" style="padding-top:10px;">
+        <div class="page-title" style="margin-bottom:12px;">
+            Genotype Summary
+        </div>
+
+        {genotype_grid}
+        {analytical_html}
         {note}
     </div>
     """
-    pages.append(_wrap_page(content, name, curr_pg, page_id=page_id))
-    curr_pg += estimated_pages
 
-    return pages, curr_pg
+    return (
+        [
+            _wrap_page(
+                content,
+                name,
+                pg,
+                page_id="genotype_summary"
+            )
+        ],
+        pg + 1
+    )
+
 
 # ============================================================================
 # PHARMCAT NO-GUIDANCE DRUG LIST
@@ -4019,7 +6740,10 @@ def pharmcat_no_guidance_template(coverage_df, patient_name, pg):
     
     if total_rows == 0:
         content = f"""
-        <div style="padding-top: 10px;">
+        <div
+            class="flow-section"
+            style="padding-top:10px;"
+        >
             <div class="page-title" id="no_guideline_available" style="margin-bottom: 10px;">
                 No Guideline Available
             </div>
@@ -4027,45 +6751,32 @@ def pharmcat_no_guidance_template(coverage_df, patient_name, pg):
                 The medications listed below are associated with genes analysed in this report. However, current clinical pharmacogenomics
                 guidelines do not yet include dosing recommendations for these specific combinations.
             </div>
-            <table style="width:100%; border-collapse:collapse; border:1px solid #dde2ea;">
-                <thead>
-                    <tr style="background:#023D79;">
-                        <th style="width:40%; padding:5px 8px; font-size:12px; text-align:left; color:#ffffff;">Medication</th>
-                        <th style="width:60%; padding:5px 8px; font-size:12px; text-align:left; color:#ffffff;">Drug Class / Category</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr><td colspan="2" style="padding:10px; text-align:center; font-size:12px; color:#6b7280;">No additional drugs identified.</td></tr>
-                </tbody>
-            </table>
+            <div class="no-guideline-grid" style="width:100%;">
+                <div class="no-guideline-grid-header">
+                    <div class="no-guideline-grid-cell" style="font-size:12px; font-weight:700;">Medication</div>
+                    <div class="no-guideline-grid-cell" style="font-size:12px; font-weight:700;">Drug Class / Category</div>
+                </div>
+                <div style="padding:10px; text-align:center; font-size:12px; color:#6b7280;">
+                    No additional drugs identified.
+                </div>
+            </div>
         </div>
         """
         pages.append(_wrap_page(content, patient_name, curr_pg, page_id="no_guideline_available"))
-        curr_pg += 1
-        return pages, curr_pg
+        return pages, pg + 1
 
-    # Calculate row heights dynamically
-    heights = []
-    for drug, display_cat in valid_rows:
-        left_chars = len(drug)
-        right_chars = len(display_cat)
-        left_lines = max(1, -(-left_chars // 20))
-        right_lines = max(1, -(-right_chars // 34))
-        lines = max(left_lines, right_lines)
-        heights.append(18 + lines * 15)
-
-    estimated_pages = max(1, sum(heights) // 860 + 1)
 
     rows_html = ""
     for i, (drug, display_cat) in enumerate(valid_rows):
         bg = "#f9fafb" if i % 2 == 0 else "#ffffff"
         rows_html += (
-            f'<tr style="background:{bg};">'
-            f'<td style="padding:5px 8px; font-size:12px; border-bottom:1px solid #e5e7eb; color:#1e3a5f; vertical-align:top;">'
-            f'<strong>{_html.escape(drug.title())}</strong></td>'
-            f'<td style="padding:5px 8px; font-size:12px; border-bottom:1px solid #e5e7eb; color:#374151; vertical-align:top;">'
-            f'{_html.escape(display_cat)}</td>'
-            f'</tr>'
+            f'<div class="keep-together no-guideline-grid-row" style="background:{bg};">'
+            f'<div class="no-guideline-grid-cell pdf-qa-no-guideline-medication" '
+            f'style="font-size:12px; color:#1e3a5f;">'
+            f'<strong>{_html.escape(drug.title())}</strong></div>'
+            f'<div class="no-guideline-grid-cell" style="font-size:12px; color:#374151;">'
+            f'{_html.escape(display_cat)}</div>'
+            f'</div>'
         )
         
     title_html = f"""
@@ -4080,25 +6791,22 @@ def pharmcat_no_guidance_template(coverage_df, patient_name, pg):
     page_id = "no_guideline_available"
         
     content = f"""
-    <div style="padding-top: 10px;">
+    <div
+        class="flow-section"
+        style="padding-top:10px;"
+    >
         {title_html}
-        <table style="width:100%; border-collapse:collapse; border:1px solid #dde2ea;">
-            <thead style="display: table-header-group;">
-                <tr style="background:#023D79;">
-                    <th style="width:40%; padding:5px 8px; font-size:12px; text-align:left; color:#ffffff;">Medication</th>
-                    <th style="width:60%; padding:5px 8px; font-size:12px; text-align:left; color:#ffffff;">Drug Class / Category</th>
-                </tr>
-            </thead>
-            <tbody>
-                {rows_html}
-            </tbody>
-        </table>
+        <div class="no-guideline-grid" style="width:100%;">
+            <div class="no-guideline-grid-header">
+                <div class="no-guideline-grid-cell" style="font-size:12px; font-weight:700;">Medication</div>
+                <div class="no-guideline-grid-cell" style="font-size:12px; font-weight:700;">Drug Class / Category</div>
+            </div>
+            {rows_html}
+        </div>
     </div>
     """
     pages.append(_wrap_page(content, patient_name, curr_pg, page_id=page_id))
-    curr_pg += estimated_pages
-    
-    return pages, curr_pg
+    return pages, pg + 1
 
 # ============================================================================
 # GENES REQUIRING SPECIALIZED TESTING
@@ -4346,18 +7054,10 @@ def specialized_genes_template(df, name, pg):
     curr_pg = pg
 
     note_html = """
-    <div style="background:#eff6ff; border:1px solid #bfdbfe; border-radius:6px; padding:10px 14px; font-size:11.5px; color:#1e40af; margin-top:8px;">
+    <div class="keep-together" style="background:#eff6ff; border:1px solid #bfdbfe; border-radius:6px; padding:10px 14px; font-size:11.5px; color:#1e40af; margin-top:8px;">
         <strong>Clinical Note:</strong> The genes listed above could not be reliably genotyped from this sample. Drug-specific recommendations for these medications therefore cannot be personalized based on your DNA. Consult your clinician or a pharmacogenomics specialist for guidance — additional specialized testing (e.g., high-resolution HLA assay, long-read sequencing for CYP2D6, enzyme activity testing for G6PD) may be required.
     </div>"""
 
-    # Calculate card heights dynamically
-    heights = []
-    for gene in gene_list:
-        cats = gene_data[gene]["categories"]
-        card_height = 230 if not cats else 190 + 26 * len(cats)
-        heights.append(card_height)
-
-    estimated_pages = max(1, sum(heights) // 860 + 1)
 
     cards_html = ""
     for gene in gene_list:
@@ -4375,27 +7075,85 @@ def specialized_genes_template(df, name, pg):
             )
 
         if cats:
-            cat_rows_html = ""
+            cat_groups_html = ""
             for cat in sorted(cats.keys()):
                 drugs_in_cat = sorted(cats[cat])
-                drug_pills = " &bull; ".join(
-                    f'<span style="color:#1a1a1a;">{d.title()}</span>'
-                    for d in drugs_in_cat
+
+                # Keep the visual format as normal comma-separated prose,
+                # but do not give Paged.js one huge inline box to fragment.
+                # Short chunks are layout-only safety units; there are no bullets
+                # and no provider/gene/drug-specific page rules.
+                chunk_lists = _comma_safe_chunks(
+                    drugs_in_cat,
+                    max_chars=220,
                 )
-                cat_rows_html += f"""
-                <tr>
-                    <td style="font-weight:700; color:#0D3B7A; vertical-align:top; white-space:nowrap; padding-right:10px;">{cat}</td>
-                    <td style="color:#374151; line-height:1.6;">{drug_pills}</td>
-                </tr>"""
-            drug_section_html = f"""
-            <div style="padding:6px 12px 8px 12px; border-top:1px solid #dde2ea;">
-                <div style="font-size:12px; font-weight:700; color:#374151; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px;">
-                    Affected Medications
+
+                chunk_html = []
+                flat_items = [item for chunk in chunk_lists for item in chunk]
+                flat_index = 0
+
+                for chunk in chunk_lists:
+                    pieces = []
+                    for d in chunk:
+                        flat_index += 1
+                        suffix = ", " if flat_index < len(flat_items) else ""
+                        pieces.append(
+                            f'<span class="pdf-qa-specialized-medication specialized-med-item">'
+                            f'{html_lib.escape(str(d).title())}'
+                            f'</span>{suffix}'
+                        )
+                    chunk_html.append(
+                        '<div class="specialized-med-chunk">'
+                        + ''.join(pieces)
+                        + '</div>'
+                    )
+
+                first_chunk = chunk_html[0] if chunk_html else ''
+                remaining_chunks = ''.join(chunk_html[1:])
+
+                cat_groups_html += f"""
+                <div class="specialized-med-group">
+                    <div class="specialized-med-first-fragment">
+                        <div class="specialized-med-category">
+                            {html_lib.escape(str(cat))}
+                        </div>
+                        <div class="specialized-med-list">
+                            {first_chunk}
+                        </div>
+                    </div>
+                    <div class="specialized-med-list">
+                        {remaining_chunks}
+                    </div>
                 </div>
-                <table style="width:100%; border-collapse:collapse; font-size:11.5px; margin:0;">
-                    <tbody>{cat_rows_html}</tbody>
-                </table>
-            </div>"""
+                """
+
+            drug_section_html = f"""
+<div
+    class="specialized-affected-section"
+    style="
+        padding:6px 12px 8px 12px;
+        border-top:1px solid #dde2ea;
+    "
+>
+
+    <div
+        class="section-block-header keep-with-next"
+        style="
+            font-size:12px;
+            font-weight:700;
+            color:#374151;
+            text-transform:uppercase;
+            letter-spacing:0.5px;
+            margin-bottom:6px;
+        "
+    >
+        Affected Medications
+    </div>
+
+    {cat_groups_html}
+
+</div>
+"""
         else:
             drug_section_html = """
             <div style="padding:8px 12px 10px 12px; border-top:1px solid #dde2ea; font-size:11.5px; color:#6b7280; font-style:italic;">
@@ -4403,19 +7161,85 @@ def specialized_genes_template(df, name, pg):
             </div>"""
 
         cards_html += f"""
-        <div style="margin-bottom:14px; border: 1px solid #dde2ea; page-break-inside: avoid; break-inside: avoid;">
-            <div style="background: #f3f5f8; padding: 7px 12px; font-size: 11.5px; font-weight: 700; color: #1a1a1a; border-bottom: 1px solid #dde2ea; display:flex; justify-content:space-between; align-items:center;">
-                <span style="font-size:11.5px; font-weight:800; color:#0D3B7A;">{gene}</span>
-                <span style="background:#fef3c7; color:#92400e; border:1px solid #fcd34d; border-radius:4px; padding:2px 8px; font-size:12px; font-weight:700;">Cannot Be Called</span>
-            </div>
-            <div style="padding:8px 12px 6px 12px; font-size:11.5px; color:#374151; line-height:1.55;">
-                {consumer_text}
-            </div>
-            <div style="padding:6px 12px 8px 12px; background:#f8fafc; font-size:12px; color:#6b7280; line-height:1.5; border-top:1px solid #f0f2f5; border-bottom:1px solid #dde2ea;">
-                <span style="font-size:12px; font-weight:700; color:#9ca3af; text-transform:uppercase; letter-spacing:0.4px;">For Clinicians &mdash; </span>{clinician_text}
-            </div>
-            {drug_section_html}
-        </div>"""
+<div
+    class="specialized-gene-card"
+    style="
+        margin-bottom:14px;
+        border:1px solid #dde2ea;
+    "
+>
+
+    <div class="specialized-gene-top">
+
+        <div style="
+            background:#f3f5f8;
+            padding:7px 12px;
+            font-size:11.5px;
+            font-weight:700;
+            color:#1a1a1a;
+            border-bottom:1px solid #dde2ea;
+            display:flex;
+            justify-content:space-between;
+            align-items:center;
+        ">
+            <span style="
+                font-size:11.5px;
+                font-weight:800;
+                color:#0D3B7A;
+            ">
+                {gene}
+            </span>
+
+            <span style="
+                background:#fef3c7;
+                color:#92400e;
+                border:1px solid #fcd34d;
+                border-radius:4px;
+                padding:2px 8px;
+                font-size:12px;
+                font-weight:700;
+            ">
+                Cannot Be Called
+            </span>
+        </div>
+
+        <div style="
+            padding:8px 12px 6px 12px;
+            font-size:11.5px;
+            color:#374151;
+            line-height:1.55;
+        ">
+            {consumer_text}
+        </div>
+
+        <div style="
+            padding:6px 12px 8px 12px;
+            background:#f8fafc;
+            font-size:12px;
+            color:#6b7280;
+            line-height:1.5;
+            border-top:1px solid #f0f2f5;
+            border-bottom:1px solid #dde2ea;
+        ">
+            <span style="
+                font-size:12px;
+                font-weight:700;
+                color:#9ca3af;
+                text-transform:uppercase;
+                letter-spacing:0.4px;
+            ">
+                For Clinicians &mdash;
+            </span>
+
+            {clinician_text}
+        </div>
+
+    </div>
+
+    {drug_section_html}
+
+</div>
+"""
 
     title_html = f"""
     <div class="page-title" id="specialized_genes" style="margin-bottom: 18px;">Genes Requiring Specialized Testing</div>
@@ -4423,14 +7247,14 @@ def specialized_genes_template(df, name, pg):
     page_id = "specialized_genes"
 
     content = f"""
-    <div style="padding-top: 10px;">
+    <div
+        class="flow-section"
+        style="padding-top:10px;"
+    >
         {title_html}
         {cards_html}
         {note_html}
     </div>
     """
     pages.append(_wrap_page(content, name, curr_pg, page_id=page_id))
-    curr_pg += estimated_pages
-
-    return pages, curr_pg
-
+    return pages, pg + 1

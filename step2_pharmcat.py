@@ -29,8 +29,6 @@ def run_pharmcat(vcf_path: str, sample_id: str) -> None:
         "-reporterHtml",
         "-reporterJson",
     ]
-    # print(f"[PGx] Running PharmCAT on {vcf_path}")
-    # print("Command:", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print("[ERROR] PharmCAT failed")
@@ -39,16 +37,10 @@ def run_pharmcat(vcf_path: str, sample_id: str) -> None:
         die("PharmCAT exited with non-zero status")
 
     json_report = os.path.join(REPORT_DIR, f"{sample_id}.report.json")
-    html_report = os.path.join(REPORT_DIR, f"{sample_id}.report.html")
-
     if not os.path.exists(json_report):
         print("STDOUT:\n", result.stdout)
         print("STDERR:\n", result.stderr)
         die(f"JSON report missing: {json_report}")
-
-    # print("[PGx] PharmCAT completed successfully")
-    # print(f"[PGx] JSON report: {json_report}")
-    # print(f"[PGx] HTML report: {html_report}")
 
 def main() -> None:
     if len(sys.argv) != 2:
@@ -59,7 +51,6 @@ def main() -> None:
     if not os.path.exists(PHARMCAT_JAR):
         die(f"PharmCAT JAR not found: {PHARMCAT_JAR}\nDownload from: https://github.com/PharmGKB/PharmCAT/releases")
     sample_id = derive_sample_id(vcf_path)
-    # print(f"[PGx] Sample ID: {sample_id}")
     run_pharmcat(vcf_path, sample_id)
 
 if __name__ == "__main__":

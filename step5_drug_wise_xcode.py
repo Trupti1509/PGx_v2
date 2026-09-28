@@ -8,7 +8,7 @@ import pandas as pd
 from HELPER.htmls_drug_wise import (
     styles, welcome_template, how_to_read_template,
     faqs_template, doctor_page_template,
-    drug_detail_template, genotype_summary_template,
+    drug_detail_template, drug_crosslisted_template, genotype_summary_template,
     pharmcat_no_guidance_template,
     toc_template, specialized_genes_template,
 )
@@ -20,6 +20,12 @@ RESULTS_DIR     = os.path.join(ROOT_DIR, "results")
 DEPS_DIR        = os.path.join(ROOT_DIR, "02_deps")
 OUTPUT_DIR      = os.path.join(RESULTS_DIR, "reports_drugwise_pdf")
 TEMP_DIR        = os.path.join(RESULTS_DIR, "temp")
+VERBOSE_OUTPUT  = os.environ.get("PGX_VERBOSE", "0").lower() not in {"0", "false", "no", "off"}
+
+
+def log(msg, *args, **kwargs):
+    if VERBOSE_OUTPUT:
+        print(msg, *args, **kwargs)
 
 FRONT_COVER     = os.path.join(DEPS_DIR, "covers", "pgx_front.pdf")
 BACK_COVER      = os.path.join(DEPS_DIR, "covers", "pgx_back.pdf")
@@ -38,38 +44,8 @@ def _find_ghostscript() -> str:
     return os.path.join(DEPS_DIR, "gswin64c.exe")
 
 GHOSTSCRIPT_BIN = _find_ghostscript()
-TOC_PAGE_BUDGET = 860
-
-def _toc_entry_height(kind: str) -> int:
-    """Approximate printed height for each TOC row type."""
-    if kind == "chapter":
-        return 36
-    if kind in {"category", "numbered_category"}:
-        return 32
-    return 26
-
-def _split_toc_entries(toc_entries):
-    chunks = []
-    current = []
-    used = 0
-
-    for entry in toc_entries:
-        kind = entry[0]
-        height = _toc_entry_height(kind)
-        starts_new_group = kind == "chapter"
-
-        if current and (used + height > TOC_PAGE_BUDGET or starts_new_group and used > TOC_PAGE_BUDGET * 0.85):
-            chunks.append(current)
-            current = []
-            used = 0
-
-        current.append(entry)
-        used += height
-
-    if current:
-        chunks.append(current)
-
-    return chunks
+# TOC physical page numbers are resolved by Paged.js after layout.
+# Python no longer estimates TOC row heights or TOC page counts.
 
 # Drugs that should be forced to "No Guideline Available" regardless of available data
 FORCED_NO_GUIDELINE_DRUGS = {
@@ -365,7 +341,7 @@ def load_master_data(sample_id):
 
     matched = [f for f in step3_files if os.path.basename(f) == f"step3_{sample_id}_MASTER.xlsx"]
     step3_path = matched[0] if matched else max(step3_files, key=os.path.getctime)
-    print(f"\n[INFO] --- EXTRACTING PURE DNA DATA FROM {os.path.basename(step3_path)} ---")
+    log(f"\n[INFO] --- EXTRACTING PURE DNA DATA FROM {os.path.basename(step3_path)} ---")
 
     try:
         raw_df = pd.read_excel(step3_path, sheet_name="3_GENOTYPE_DETAILS")
@@ -424,24 +400,6 @@ def load_master_data(sample_id):
         pass
 
     return df_genes, drug_gene_map, recs_df
-
-def estimate_toc_pages(df):
-    category_col = "Therapeutic Category" if "Therapeutic Category" in df.columns else "Drug Category"
-    categories   = df[category_col].nunique()
-    unique_drugs = df["Drug Name"].nunique()
-    estimated_height = (
-        5 * _toc_entry_height("chapter")
-        + categories * _toc_entry_height("numbered_category")
-        + unique_drugs * _toc_entry_height("drug")
-        + 10 * _toc_entry_height("static")
-    )
-    return max(1, -(-estimated_height // TOC_PAGE_BUDGET))
-
-def _estimate_toc_pages_from_entries(toc_entries):
-    used = 0
-    for entry in toc_entries:
-        used += _toc_entry_height(entry[0])
-    return max(1, -(-used // TOC_PAGE_BUDGET))
 
 def build_toc_pages(toc_entries, patient_name, toc_start_pg):
     page = toc_template(toc_entries, patient_name, toc_start_pg)
@@ -619,11 +577,21 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
     try:
         # Use Step3 recommendations to precisely match patient diplotype/phenotype/activity
         def _norm_pheno(s: str) -> str:
+            """Normalize phenotype labels without collapsing clinically distinct terms.
+
+            Important: keep words such as "possible", "decreased", "function",
+            and "metabolizer".  Removing or token-matching those words can make
+            "Decreased Function" accidentally match "Possible Decreased Function".
+            Only harmless formatting differences and an Activity Score suffix are removed.
+            """
             if s is None:
                 return ""
-            s = str(s).lower()
-            s = re.sub(r"\(.*?\)", "", s)  # remove parenthetical
-            s = s.replace("metabolizer", "").replace("function", "").strip()
+            s = str(s).strip().lower()
+            # Some upstream values can be prefixed as "GENE: Phenotype".
+            s = re.sub(r"^[a-z0-9-]+\s*:\s*", "", s)
+            # Activity score is matched separately when available.
+            s = re.sub(r"\s*\(\s*as\s*:\s*[^)]+\)", "", s, flags=re.IGNORECASE)
+            s = re.sub(r"\s+", " ", s).strip()
             return s
 
         def _source_tag(src: str) -> str:
@@ -770,18 +738,13 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
                                 if str(rec_as).strip().lower() == str(oas).strip().lower():
                                     matched = True
                                     match_score = 3
-                        # Phenotype exact/token match
-                        elif rec_pheno and ophen:
-                            if rec_pheno == ophen:
-                                matched = True
-                                match_score = 2
-                            else:
-                                # require token overlap rather than naive substring
-                                rec_tokens = set([t for t in rec_pheno.split() if t])
-                                o_tokens = set([t for t in ophen.split() if t])
-                                if rec_tokens & o_tokens:
-                                    matched = True
-                                    match_score = 1
+                        # Phenotype match must be exact after safe normalization.
+                        # Do NOT use token overlap: e.g. "Decreased Function" and
+                        # "Possible Decreased Function" share words but are different
+                        # patient phenotypes with potentially different guidance.
+                        elif rec_pheno and ophen and rec_pheno == ophen:
+                            matched = True
+                            match_score = 2
 
                         if matched:
                             matched_recs.append((src_tag, r, match_score))
@@ -897,13 +860,12 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
         pass
         # print(f"[WARN] Authoritative-source enforcement failed: {_e}")
 
-    # ── TOC & Page Generation ───────────────────────────────────────────
-    df_detailed_for_toc = df_detailed.copy()
-    toc_pg_count = estimate_toc_pages(df_detailed_for_toc)
+    # ── TOC & Section Generation ────────────────────────────────────────
+    # The TOC is one logical HTML section and may span any number of physical
+    # pages. Paged.js calculates those pages after the complete document is
+    # laid out, so no TOC page-height estimate is needed here.
     toc_start_pg = 1
-    pg = 1 + toc_pg_count
-
-    # print(f"[INFO] TOC estimate: {toc_pg_count} page(s) | content pages start at pg {pg}")
+    pg = 2
 
     # Introduction pages
     welcome_pg = pg
@@ -996,61 +958,152 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
     # print(f"[INFO] rs12777823 in step1 VCF: {_rs12777823_in_step1}")
 
     # Drug Detail Pages
+    #
+    # Multi-category layout rule:
+    #   * Build the TOC by therapeutic category (so readers can still find a
+    #     drug under every category it belongs to).
+    #   * Render the BODY by unique drug.  All category occurrences for the same
+    #     drug are kept together, one immediately after another.
+    #   * The first category gets the full monograph/recommendation.
+    #   * Additional categories keep their own category-specific About /
+    #     What-It-Means content and say "See the full recommendation above."
+    #   * Because all category blocks live inside one logical drug section, the
+    #     generation-level topic break occurs only after the whole drug cluster.
     category_col = "Therapeutic Category" if "Therapeutic Category" in df_detailed.columns else "Drug Category"
-    present_categories = list(dict.fromkeys(df_detailed[category_col].astype(str)))
     category_order = _load_therapeutic_category_order()
+    valid_categories = set(category_order)
+
+    present_categories_raw = [
+        str(c).strip() for c in dict.fromkeys(df_detailed[category_col].astype(str))
+        if str(c).strip() and str(c).strip().lower() not in {"nan", "none"}
+    ]
+    # Prefer real GSI therapeutic categories.  Internal routing labels such as
+    # "Medications Evaluated — Has Guidance" must never become visible chapters.
+    present_categories = [c for c in present_categories_raw if not valid_categories or c in valid_categories]
     categories = [c for c in category_order if c in present_categories]
     categories.extend([c for c in present_categories if c not in categories])
-    is_first_drug = True
-    cat_counter = 1
+
+    from HELPER.htmls_drug_wise import sanitize_id
+
+    # ------------------------------------------------------------------
+    # 1) Build category -> drugs and the BODY drug order.
+    #    A drug's primary category is simply the first category in the
+    #    established therapeutic-category order where that drug appears.
+    # ------------------------------------------------------------------
+    category_to_drugs = {}
+    ordered_drugs = []
+    seen_drugs = set()
 
     for category in categories:
-        category_drugs = df_detailed[df_detailed[category_col] == category]["Drug Name"].astype(str)
-        unique_drugs = list(dict.fromkeys(category_drugs))
+        category_mask = df_detailed[category_col].astype(str).str.strip() == str(category).strip()
+        cat_drugs = list(dict.fromkeys(
+            df_detailed.loc[category_mask, "Drug Name"].astype(str).tolist()
+        ))
+        cat_drugs = [d for d in cat_drugs if str(d).strip()]
+        category_to_drugs[category] = cat_drugs
 
-        if not unique_drugs:
+        for drug in cat_drugs:
+            drug_key = str(drug).strip().lower()
+            if drug_key not in seen_drugs:
+                seen_drugs.add(drug_key)
+                ordered_drugs.append(drug)
+
+    # ------------------------------------------------------------------
+    # 2) Build the category-based TOC independently from BODY order.
+    #    Every category occurrence has its own anchor. Paged.js resolves the
+    #    physical page dynamically with target-counter(), so two category blocks
+    #    can legitimately show the same page when they fit together.
+    # ------------------------------------------------------------------
+    cat_counter = 1
+    for category in categories:
+        cat_drugs = category_to_drugs.get(category, [])
+        if not cat_drugs:
             continue
 
-        cat_toc_idx = len(toc_entries)
         toc_entries.append(("numbered_category", f"3.{cat_counter}  {category}", None))
         cat_counter += 1
 
-        cat_first_pg = None
-        for drug in unique_drugs:
-            # Render every drug under every category it belongs to so the
-            # category label on the page always matches the TOC section.
-            drug_rows = df_detailed[df_detailed["Drug Name"] == drug]
-            if drug_rows.empty:
+        for drug in cat_drugs:
+            anchor = sanitize_id(drug) + "__" + sanitize_id(category)
+            toc_entries.append(("drug", (drug, anchor), None))
+
+    # ------------------------------------------------------------------
+    # 3) Render one contiguous cluster per unique drug.
+    # ------------------------------------------------------------------
+    is_first_drug = True
+
+    for drug in ordered_drugs:
+        drug_key = str(drug).strip().lower()
+        all_drug_rows = df_detailed[
+            df_detailed["Drug Name"].astype(str).str.strip().str.lower() == drug_key
+        ].copy()
+        if all_drug_rows.empty:
+            continue
+
+        drug_categories = [
+            category for category in categories
+            if drug in category_to_drugs.get(category, [])
+        ]
+        if not drug_categories:
+            continue
+
+        primary_category = drug_categories[0]
+        primary_rows = all_drug_rows[
+            all_drug_rows[category_col].astype(str).str.strip() == str(primary_category).strip()
+        ].copy()
+        if primary_rows.empty:
+            continue
+
+        # Put primary-category rows first.  drug_detail_template uses the first
+        # non-empty category-specific explanatory text for the full monograph,
+        # while retaining all unique gene/phenotype/recommendation rows.
+        other_rows = all_drug_rows.drop(index=primary_rows.index, errors="ignore")
+        ordered_drug_rows = pd.concat([primary_rows, other_rows], ignore_index=True)
+
+        primary_anchor = sanitize_id(drug) + "__" + sanitize_id(primary_category)
+
+        # Build secondary category blocks as FRAGMENTS.  They are inserted at the
+        # end of the primary drug's final continuation page, so there is no forced
+        # report-topic break between categories of the same drug.
+        secondary_blocks = []
+        for secondary_category in drug_categories[1:]:
+            category_rows = all_drug_rows[
+                all_drug_rows[category_col].astype(str).str.strip() == str(secondary_category).strip()
+            ].copy()
+            if category_rows.empty:
                 continue
 
-            drug_start_pg = pg
-            if cat_first_pg is None:
-                cat_first_pg = drug_start_pg
-
-            res = drug_detail_template(
-                drug_name=drug,
-                category=category,
-                drug_rows=drug_rows,
-                patient_name=patient_name,
-                curr_pg=pg,
-                is_section_start=is_first_drug,
-                coverage_categories=categories if is_first_drug else None,
-                master_genes_df=df_master_genes,
-                drug_gene_map=drug_gene_map,
-                drug_gene_catalog=drug_gene_catalog,
-                rs12777823_in_step1=_rs12777823_in_step1,
-                per_drug_overrides=_PER_DRUG_OVERRIDES,
+            secondary_blocks.append(
+                drug_crosslisted_template(
+                    drug_name=drug,
+                    category=secondary_category,
+                    category_rows=category_rows,
+                    patient_name=patient_name,
+                    curr_pg=pg,
+                    primary_category=primary_category,
+                    primary_anchor=primary_anchor,
+                    primary_rows=primary_rows,
+                    as_fragment=True,
+                )
             )
-            pg = safe_append(pages, res, pg)
-            # Build category-aware anchor matching drug_detail_template's drug_id
-            from HELPER.htmls_drug_wise import sanitize_id
-            _toc_anchor = sanitize_id(drug) + "__" + sanitize_id(category)
-            toc_entries.append(("drug", (drug, _toc_anchor), drug_start_pg))
-            is_first_drug = False
 
-        if cat_first_pg is not None:
-            kind, lbl, _ = toc_entries[cat_toc_idx]
-            toc_entries[cat_toc_idx] = (kind, lbl, cat_first_pg)
+        res = drug_detail_template(
+            drug_name=drug,
+            category=primary_category,
+            drug_rows=ordered_drug_rows,
+            patient_name=patient_name,
+            curr_pg=pg,
+            is_section_start=is_first_drug,
+            coverage_categories=categories if is_first_drug else None,
+            master_genes_df=df_master_genes,
+            drug_gene_map=drug_gene_map,
+            drug_gene_catalog=drug_gene_catalog,
+            rs12777823_in_step1=_rs12777823_in_step1,
+            per_drug_overrides=_PER_DRUG_OVERRIDES,
+            extra_category_blocks=secondary_blocks,
+        )
+        pg = safe_append(pages, res, pg)
+        is_first_drug = False
 
     # === NO GUIDELINE AVAILABLE (before OEM) ===
     toc_entries.append(("chapter", "4. Additional Information", None))
@@ -1115,16 +1168,7 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
     res = disclaimer_template(patient_name, disclaimer_start_pg)
     pg = safe_append(pages, res, pg)
 
-    # Build TOC
-    actual_toc_pg_count = _estimate_toc_pages_from_entries(toc_entries)
-    if actual_toc_pg_count != toc_pg_count:
-        delta = actual_toc_pg_count - toc_pg_count
-        # print(f"[INFO] TOC adjusted: {actual_toc_pg_count} page(s) after height-aware calculation")
-        toc_entries = [
-            (kind, label, (pagenum + delta if isinstance(pagenum, int) and pagenum > toc_pg_count else pagenum))
-            for kind, label, pagenum in toc_entries
-        ]
-
+    # Build TOC. Page numbers inside it are generated with CSS target-counter().
     toc_pages = build_toc_pages(toc_entries, patient_name, toc_start_pg)
     for i, toc_page in enumerate(toc_pages):
         pages.insert(i, toc_page)
@@ -1132,13 +1176,12 @@ def build_report(df, patient_name, sample_id, step4_path: str = ""):
     # print(f"[INFO] Report total: {len(pages)} pages")
     return pages
 
-def main(patient_name: str, sample_id: str = ""):
+def main(patient_name: str, sample_id: str = "", show_summary: bool = True):
     name = patient_name.strip()
 
-    print("\n" + "=" * 60)
-    # print("  PGx Pipeline -- Step 5: PDF Report Generation")
-    # print(f"  Patient: {name}")
-    print("=" * 60)
+    if VERBOSE_OUTPUT:
+        print("\n" + "=" * 60)
+        print("=" * 60)
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(TEMP_DIR,   exist_ok=True)
@@ -1164,7 +1207,7 @@ def main(patient_name: str, sample_id: str = ""):
 
     pages = build_report(df, name, sample_id, step4_path=path)
 
-    final_pdf = generate_report(
+    result = generate_report(
         pages=pages,
         patient_name=name,
         front_cover=FRONT_COVER,
@@ -1174,8 +1217,24 @@ def main(patient_name: str, sample_id: str = ""):
         ghostscript_bin=GHOSTSCRIPT_BIN,
     )
 
+    if isinstance(result, tuple):
+        final_pdf, final_html = result
+    else:
+        final_pdf = result
+        final_html = None
+
     if final_pdf:
-        print(f"\n[OK] Report ready: {final_pdf}")
+        if final_html:
+            if VERBOSE_OUTPUT:
+                print(f"\n[OK] PDF: {final_pdf}")
+                print(f"[OK] HTML: {final_html}")
+            elif show_summary:
+                print(f"PDF: {final_pdf}")
+                print(f"HTML: {final_html}")
+        elif VERBOSE_OUTPUT:
+            print(f"\n[OK] Report ready: {final_pdf}")
+        elif show_summary:
+            print(f"Report ready: {final_pdf}")
     else:
         print("\n[FAIL] Generation failed -- check logs above.")
 

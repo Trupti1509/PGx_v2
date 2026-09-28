@@ -1,2 +1,6 @@
 pandas
+numpy
 openpyxl
+PyMuPDF
+PyPDF2
+xlsxwriter
